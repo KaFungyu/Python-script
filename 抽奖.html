@@ -1,0 +1,1351 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D年会抽奖系统</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --glass-bg: rgba(255, 255, 255, 0.15);
+            --glass-border: rgba(255, 255, 255, 0.25);
+            --glass-shadow: rgba(0, 0, 0, 0.15);
+            --blur-amount: 24px;
+            --text-primary: #ffffff;
+            --text-secondary: rgba(255, 255, 255, 0.7);
+            --accent: #007AFF;
+            --accent-glow: rgba(0, 122, 255, 0.5);
+            --red: #FF3B30;
+            --green: #34C759;
+            --orange: #FF9500;
+            --yellow: #FFCC00;
+            --purple: #AF52DE;
+            --cyan: #5AC8FA;
+            --pink: #FF2D55;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        html,
+        body {
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+        }
+
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            background: linear-gradient(135deg, #0c0c1e 0%, #1a1a3e 25%, #2d1b4e 50%, #1e3a5f 75%, #0a2540 100%);
+            background-size: 400% 400%;
+            animation: gradientShift 20s ease infinite;
+            display: flex;
+            color: var(--text-primary);
+            transform: translateZ(0);
+        }
+
+        @keyframes gradientShift {
+
+            0%,
+            100% {
+                background-position: 0% 50%;
+            }
+
+            50% {
+                background-position: 100% 50%;
+            }
+        }
+
+        /* 星空背景 */
+        .stars {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+            z-index: 0;
+        }
+
+        .star {
+            position: absolute;
+            width: 2px;
+            height: 2px;
+            background: white;
+            border-radius: 50%;
+            animation: twinkle 3s infinite;
+        }
+
+        @keyframes twinkle {
+
+            0%,
+            100% {
+                opacity: 0.3;
+            }
+
+            50% {
+                opacity: 1;
+            }
+        }
+
+        .glass-panel {
+            background: var(--glass-bg);
+            backdrop-filter: blur(var(--blur-amount));
+            -webkit-backdrop-filter: blur(var(--blur-amount));
+            border: 1px solid var(--glass-border);
+            border-radius: 24px;
+            box-shadow: 0 8px 32px var(--glass-shadow), inset 0 1px 0 rgba(255, 255, 255, 0.1);
+        }
+
+        .left-panel {
+            width: 320px;
+            padding: 20px;
+            margin: 16px;
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+            z-index: 10;
+            flex-shrink: 0;
+        }
+
+        .center-stage {
+            flex: 1;
+            position: relative;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+        }
+
+        #container3d {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: 1;
+        }
+
+        .control-bar {
+            position: absolute;
+            bottom: 30px;
+            left: 50%;
+            transform: translateX(-50%);
+            display: flex;
+            gap: 16px;
+            z-index: 100;
+        }
+
+        .right-panel {
+            width: 300px;
+            padding: 20px;
+            margin: 16px;
+            display: flex;
+            flex-direction: column;
+            z-index: 10;
+            flex-shrink: 0;
+            max-height: calc(100vh - 32px);
+            overflow-y: auto;
+        }
+
+        .section-title {
+            font-size: 13px;
+            font-weight: 700;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: 12px;
+        }
+
+        .stat-row {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding: 12px 16px;
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 14px;
+            margin-bottom: 12px;
+        }
+
+        .stat-number {
+            font-size: 32px;
+            font-weight: 700;
+            background: linear-gradient(135deg, var(--cyan), var(--purple));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .stat-label {
+            font-size: 14px;
+            font-weight: 500;
+            color: var(--text-secondary);
+        }
+
+        .prize-config {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        .prize-row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .prize-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            flex-shrink: 0;
+        }
+
+        .prize-label {
+            font-size: 13px;
+            font-weight: 600;
+            width: 56px;
+            flex-shrink: 0;
+        }
+
+        .glass-input {
+            background: rgba(255, 255, 255, 0.1);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            border-radius: 10px;
+            padding: 0 12px;
+            height: 36px;
+            line-height: 34px;
+            font-size: 13px;
+            color: var(--text-primary);
+            font-weight: 500;
+            outline: none;
+            transition: all 0.2s;
+        }
+
+        .glass-input:focus {
+            background: rgba(255, 255, 255, 0.15);
+            border-color: var(--accent);
+            box-shadow: 0 0 0 3px var(--accent-glow);
+        }
+
+        .glass-input::placeholder {
+            color: rgba(255, 255, 255, 0.4);
+        }
+
+        .prize-count-input {
+            width: 60px;
+            text-align: center;
+        }
+
+        .prize-name-input {
+            flex: 1;
+            min-width: 0;
+            text-align: left;
+        }
+
+        input[type=number]::-webkit-inner-spin-button,
+        input[type=number]::-webkit-outer-spin-button {
+            -webkit-appearance: none;
+            margin: 0;
+        }
+
+        .glass-btn {
+            background: linear-gradient(135deg, var(--accent), #0A84FF);
+            color: white;
+            border: none;
+            border-radius: 14px;
+            padding: 14px 28px;
+            font-size: 15px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s;
+            box-shadow: 0 4px 20px var(--accent-glow);
+            position: relative;
+            overflow: hidden;
+        }
+
+        .glass-btn::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: -100%;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.2), transparent);
+            transition: left 0.5s;
+        }
+
+        .glass-btn:hover::before {
+            left: 100%;
+        }
+
+        .glass-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 30px var(--accent-glow);
+        }
+
+        .glass-btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .glass-btn.stop {
+            background: linear-gradient(135deg, var(--red), #FF6B6B);
+            box-shadow: 0 4px 20px rgba(255, 59, 48, 0.5);
+        }
+
+        .glass-btn.secondary {
+            background: rgba(255, 255, 255, 0.15);
+            box-shadow: none;
+        }
+
+        .glass-btn.secondary:hover {
+            background: rgba(255, 255, 255, 0.25);
+            box-shadow: none;
+        }
+
+        .glass-btn.small {
+            padding: 8px 12px;
+            font-size: 12px;
+            border-radius: 10px;
+        }
+
+        .import-section {
+            display: flex;
+            gap: 8px;
+            margin-top: 12px;
+        }
+
+        .result-section {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            min-height: 0;
+            overflow-y: auto;
+        }
+
+        .result-category {
+            margin-bottom: 16px;
+        }
+
+        .result-header {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 8px;
+        }
+
+        .result-title {
+            font-size: 15px;
+            font-weight: 700;
+        }
+
+        .result-count {
+            font-size: 12px;
+            color: var(--text-secondary);
+            background: rgba(255, 255, 255, 0.1);
+            padding: 2px 8px;
+            border-radius: 10px;
+        }
+
+        .result-list {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+        }
+
+        .winner-tag {
+            padding: 6px 12px;
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 20px;
+            font-size: 13px;
+            font-weight: 500;
+            border: 1px solid rgba(255, 255, 255, 0.15);
+            animation: popIn 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+        }
+
+        @keyframes popIn {
+            from {
+                transform: scale(0);
+                opacity: 0;
+            }
+
+            to {
+                transform: scale(1);
+                opacity: 1;
+            }
+        }
+
+        /* 3D卡片样式 */
+        .card-3d {
+            width: 100px;
+            height: 60px;
+            background: linear-gradient(135deg, rgba(255, 255, 255, 0.15), rgba(255, 255, 255, 0.05));
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            border-radius: 12px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            box-shadow: 0 4px 16px rgba(0, 0, 0, 0.2), inset 0 1px 0 rgba(255, 255, 255, 0.1);
+            will-change: transform;
+            transform: translateZ(0);
+        }
+
+        .card-3d:hover {
+            /* 禁用hover效果以提升大量卡片时的性能 */
+        }
+
+        .card-3d.winner {
+            background: linear-gradient(135deg, rgba(255, 59, 48, 0.4), rgba(255, 59, 48, 0.2));
+            border-color: var(--red);
+            box-shadow: 0 0 30px rgba(255, 59, 48, 0.5);
+        }
+
+        .card-3d .card-index {
+            font-size: 10px;
+            color: rgba(255, 255, 255, 0.5);
+            font-weight: 600;
+        }
+
+        .card-3d .card-name {
+            font-size: 14px;
+            font-weight: 700;
+            color: white;
+            text-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
+        }
+
+        /* 中奖特写覆盖层 */
+        .spotlight-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.7);
+            backdrop-filter: blur(20px);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            z-index: 1000;
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.5s;
+        }
+
+        .spotlight-overlay.active {
+            opacity: 1;
+            pointer-events: all;
+        }
+
+        .spotlight-card {
+            width: 400px;
+            height: 280px;
+            background: linear-gradient(135deg, rgba(255, 255, 255, 0.2), rgba(255, 255, 255, 0.05));
+            backdrop-filter: blur(30px);
+            border: 2px solid rgba(255, 255, 255, 0.3);
+            border-radius: 32px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.4), 0 0 100px var(--accent-glow);
+            transform: scale(0.5);
+            transition: transform 0.6s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+        }
+
+        .spotlight-overlay.active .spotlight-card {
+            transform: scale(1);
+        }
+
+        .spotlight-congrats {
+            font-size: 24px;
+            margin-bottom: 16px;
+        }
+
+        .spotlight-name {
+            font-size: 72px;
+            font-weight: 700;
+            background: linear-gradient(135deg, var(--yellow), var(--orange), var(--pink));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            text-shadow: none;
+            filter: drop-shadow(0 4px 8px rgba(0, 0, 0, 0.3));
+        }
+
+        .spotlight-prize {
+            font-size: 28px;
+            font-weight: 600;
+            color: var(--cyan);
+            margin-top: 20px;
+        }
+
+        /* 粒子效果 */
+        .particle {
+            position: fixed;
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            pointer-events: none;
+            z-index: 1001;
+        }
+
+        /* 滚动条 */
+        ::-webkit-scrollbar {
+            width: 6px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: transparent;
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: rgba(255, 255, 255, 0.2);
+            border-radius: 3px;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: rgba(255, 255, 255, 0.4);
+        }
+
+        /* 当前奖项指示器 */
+        .current-prize-indicator {
+            padding: 10px 16px;
+            background: linear-gradient(135deg, rgba(0, 122, 255, 0.3), rgba(0, 122, 255, 0.1));
+            border: 1px solid var(--accent);
+            border-radius: 12px;
+            font-size: 14px;
+            font-weight: 600;
+            text-align: center;
+            margin-bottom: 12px;
+        }
+
+        /* 提示文本 */
+        .hint-text {
+            font-size: 12px;
+            color: var(--text-secondary);
+            text-align: center;
+            margin-top: 8px;
+        }
+    </style>
+</head>
+
+<body>
+    <!-- 星空背景 -->
+    <div class="stars" id="stars"></div>
+
+    <!-- 左侧配置面板 -->
+    <div class="glass-panel left-panel">
+        <div>
+            <div class="section-title">奖项配置</div>
+            <div class="stat-row">
+                <div class="stat-number" id="remainingCount">0</div>
+                <div class="stat-label">剩余人数</div>
+            </div>
+            <div class="current-prize-indicator" id="prizeIndicator">准备开始</div>
+            <div class="prize-config">
+                <div class="prize-row">
+                    <div class="prize-dot" style="background: var(--yellow);"></div>
+                    <span class="prize-label">特等奖</span>
+                    <input type="number" class="glass-input prize-count-input" id="specialCount" placeholder="人数">
+                    <input type="text" class="glass-input prize-name-input" id="specialPrize" placeholder="奖品名称">
+                </div>
+                <div class="prize-row">
+                    <div class="prize-dot" style="background: var(--red);"></div>
+                    <span class="prize-label">一等奖</span>
+                    <input type="number" class="glass-input prize-count-input" id="firstCount" placeholder="人数">
+                    <input type="text" class="glass-input prize-name-input" id="firstPrize" placeholder="奖品名称">
+                </div>
+                <div class="prize-row">
+                    <div class="prize-dot" style="background: var(--orange);"></div>
+                    <span class="prize-label">二等奖</span>
+                    <input type="number" class="glass-input prize-count-input" id="secondCount" placeholder="人数">
+                    <input type="text" class="glass-input prize-name-input" id="secondPrize" placeholder="奖品名称">
+                </div>
+                <div class="prize-row">
+                    <div class="prize-dot" style="background: var(--cyan);"></div>
+                    <span class="prize-label">三等奖</span>
+                    <input type="number" class="glass-input prize-count-input" id="thirdCount" placeholder="人数">
+                    <input type="text" class="glass-input prize-name-input" id="thirdPrize" placeholder="奖品名称">
+                </div>
+            </div>
+        </div>
+        <div class="hint-text">按 空格键 或点击按钮开始/停止抽奖</div>
+        <div class="import-section">
+            <button class="glass-btn small" onclick="downloadTemplate()">下载名单模板</button>
+            <button class="glass-btn small" onclick="document.getElementById('fileInput').click()">导入名单</button>
+            <input type="file" id="fileInput" accept=".xlsx,.xls" style="display:none" onchange="importList(this)">
+        </div>
+    </div>
+
+    <!-- 中间3D舞台 -->
+    <div class="center-stage">
+        <div id="container3d"></div>
+        <div class="control-bar">
+            <button class="glass-btn" id="drawBtn" onclick="toggleDraw()">开始抽奖</button>
+            <button class="glass-btn secondary" id="resetBtn" onclick="resetAll()">重置</button>
+        </div>
+    </div>
+
+    <!-- 右侧中奖结果面板 -->
+    <div class="glass-panel right-panel">
+        <div class="section-title">中奖名单</div>
+        <div class="result-section">
+            <div class="result-category">
+                <div class="result-header">
+                    <div class="prize-dot" style="background: var(--yellow);"></div>
+                    <span class="result-title" id="specialTitle">特等奖</span>
+                    <span class="result-count" id="specialResultCount">0/0</span>
+                </div>
+                <div class="result-list" id="specialWinners"></div>
+            </div>
+            <div class="result-category">
+                <div class="result-header">
+                    <div class="prize-dot" style="background: var(--red);"></div>
+                    <span class="result-title" id="firstTitle">一等奖</span>
+                    <span class="result-count" id="firstResultCount">0/0</span>
+                </div>
+                <div class="result-list" id="firstWinners"></div>
+            </div>
+            <div class="result-category">
+                <div class="result-header">
+                    <div class="prize-dot" style="background: var(--orange);"></div>
+                    <span class="result-title" id="secondTitle">二等奖</span>
+                    <span class="result-count" id="secondResultCount">0/0</span>
+                </div>
+                <div class="result-list" id="secondWinners"></div>
+            </div>
+            <div class="result-category">
+                <div class="result-header">
+                    <div class="prize-dot" style="background: var(--cyan);"></div>
+                    <span class="result-title" id="thirdTitle">三等奖</span>
+                    <span class="result-count" id="thirdResultCount">0/0</span>
+                </div>
+                <div class="result-list" id="thirdWinners"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 中奖特写覆盖层 -->
+    <div class="spotlight-overlay" id="spotlightOverlay">
+        <div class="spotlight-card">
+            <div class="spotlight-congrats">🎉 恭喜 🎉</div>
+            <div class="spotlight-name" id="spotlightName"></div>
+            <div class="spotlight-prize" id="spotlightPrize"></div>
+        </div>
+    </div>
+
+    <!-- Three.js 及 TWEEN.js CDN -->
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+            "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+        }
+    }
+    </script>
+    <script src="https://unpkg.com/@tweenjs/tween.js@21.0.0/dist/tween.umd.js"></script>
+    <script src="https://unpkg.com/exceljs@4.4.0/dist/exceljs.min.js"></script>
+    <script src="https://unpkg.com/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { CSS3DRenderer, CSS3DObject } from 'three/addons/renderers/CSS3DRenderer.js';
+
+        // ========== 数据源 ==========
+        let available = [];
+
+        // ========== 状态管理 ==========
+        const state = {
+            isInitialized: false,
+            isSpinning: false,
+            isShowingWinner: false,
+            currentPrize: null,
+            prizeOrder: ['third', 'second', 'first', 'special'],
+            prizeIndex: 0,
+            remaining: {},
+            winners: { special: [], first: [], second: [], third: [] },
+            rotationSpeed: 0.002,
+            targetSpeed: 0.002,
+            remainingCount: 0
+        };
+
+        const prizeLabels = {
+            third: '三等奖',
+            second: '二等奖',
+            first: '一等奖',
+            special: '特等奖'
+        };
+
+        const prizeColors = {
+            third: '#5AC8FA',
+            second: '#FF9500',
+            first: '#FF3B30',
+            special: '#FFCC00'
+        };
+
+        // ========== Three.js 场景 ==========
+        let scene, camera, renderer;
+        let sphere, cardObjects = [];
+        let sphereGroup;
+
+        function initThree() {
+            const container = document.getElementById('container3d');
+            const width = container.clientWidth;
+            const height = container.clientHeight;
+
+            // 场景
+            scene = new THREE.Scene();
+
+            // 相机
+            camera = new THREE.PerspectiveCamera(60, width / height, 1, 5000);
+            camera.position.z = 800;
+
+            // CSS3D渲染器
+            renderer = new CSS3DRenderer();
+            renderer.setSize(width, height);
+            container.appendChild(renderer.domElement);
+
+            // 球体容器
+            sphereGroup = new THREE.Group();
+            scene.add(sphereGroup);
+
+            // 创建卡片
+            createCards();
+
+            // 窗口自适应(防抖)
+            let resizeTimer;
+            window.addEventListener('resize', () => {
+                clearTimeout(resizeTimer);
+                resizeTimer = setTimeout(onWindowResize, 100);
+            });
+
+            // 渲染循环
+            animate();
+        }
+
+        // 斐波那契球体算法 - 均匀分布点
+        function fibonacciSphere(samples, radius) {
+            const points = [];
+            const phi = Math.PI * (3 - Math.sqrt(5)); // 黄金角
+
+            for (let i = 0; i < samples; i++) {
+                const y = 1 - (i / (samples - 1)) * 2;
+                const radiusAtY = Math.sqrt(1 - y * y);
+                const theta = phi * i;
+
+                const x = Math.cos(theta) * radiusAtY;
+                const z = Math.sin(theta) * radiusAtY;
+
+                points.push(new THREE.Vector3(x * radius, y * radius, z * radius));
+            }
+            return points;
+        }
+
+        function createCards() {
+            // 清除旧卡片
+            cardObjects.forEach(obj => {
+                sphereGroup.remove(obj);
+                obj.element.remove();
+            });
+            cardObjects = [];
+
+            // 根据人数动态调整球体半径和卡片大小
+            const count = available.length;
+            let radius, cardScale;
+            if (count <= 50) {
+                radius = 400;
+                cardScale = 1;
+            } else if (count <= 200) {
+                radius = 500;
+                cardScale = 0.8;
+            } else if (count <= 500) {
+                radius = 650;
+                cardScale = 0.6;
+            } else {
+                radius = 800;
+                cardScale = 0.5;
+            }
+
+            // 调整相机位置
+            camera.position.z = radius * 2;
+
+            const positions = fibonacciSphere(count, radius);
+
+            available.forEach((name, index) => {
+                // 创建卡片DOM
+                const card = document.createElement('div');
+                card.className = 'card-3d';
+                card.style.transform = `scale(${cardScale})`;
+                card.innerHTML = `
+                    <div class="card-index">#${index + 1}</div>
+                    <div class="card-name">${name}</div>
+                `;
+                card.dataset.index = index;
+                card.dataset.name = name;
+
+                // 创建CSS3D对象
+                const object = new CSS3DObject(card);
+                const pos = positions[index];
+                object.position.copy(pos);
+
+                // 让卡片面朝球心外部
+                object.lookAt(new THREE.Vector3(0, 0, 0));
+                object.rotateY(Math.PI);
+
+                // 存储原始位置
+                object.userData = {
+                    originalPosition: pos.clone(),
+                    originalRotation: object.rotation.clone(),
+                    name: name,
+                    index: index,
+                    isWinner: false
+                };
+
+                sphereGroup.add(object);
+                cardObjects.push(object);
+            });
+        }
+
+        function onWindowResize() {
+            const container = document.getElementById('container3d');
+            const width = container.clientWidth;
+            const height = container.clientHeight;
+
+            camera.aspect = width / height;
+            camera.updateProjectionMatrix();
+            renderer.setSize(width, height);
+        }
+
+        let lastTime = 0;
+        function animate(currentTime) {
+            requestAnimationFrame(animate);
+
+            // 限制帧率为60fps
+            if (currentTime - lastTime < 16) return;
+            lastTime = currentTime;
+
+            TWEEN.update();
+
+            // 球体旋转
+            if (sphereGroup) {
+                // 平滑过渡旋转速度
+                state.rotationSpeed += (state.targetSpeed - state.rotationSpeed) * 0.05;
+                sphereGroup.rotation.y += state.rotationSpeed;
+                sphereGroup.rotation.x = Math.sin(currentTime * 0.0003) * 0.1;
+            }
+
+            renderer.render(scene, camera);
+        }
+
+        // ========== 抽奖逻辑 ==========
+        function initLottery() {
+            const special = parseInt(document.getElementById('specialCount').value) || 0;
+            const first = parseInt(document.getElementById('firstCount').value) || 0;
+            const second = parseInt(document.getElementById('secondCount').value) || 0;
+            const third = parseInt(document.getElementById('thirdCount').value) || 0;
+
+            const total = special + first + second + third;
+            if (total === 0) {
+                alert('请设置至少一个奖项的人数');
+                return;
+            }
+
+            if (total > available.length) {
+                alert(`奖项总人数(${total})超过参与人数(${available.length})`);
+                return;
+            }
+
+            // 初始化剩余数量
+            state.remaining = { special, first, second, third };
+            state.prizeIndex = 0;
+
+            // 跳过人数为0的奖项
+            while (state.prizeIndex < state.prizeOrder.length &&
+                state.remaining[state.prizeOrder[state.prizeIndex]] === 0) {
+                state.prizeIndex++;
+            }
+
+            if (state.prizeIndex >= state.prizeOrder.length) {
+                alert('所有奖项人数都为0');
+                return;
+            }
+
+            state.currentPrize = state.prizeOrder[state.prizeIndex];
+            state.isInitialized = true;
+            state.remainingCount = available.length;
+
+            // 更新UI
+            updatePrizeIndicator();
+            updateResultCounts();
+            document.getElementById('remainingCount').textContent = state.remainingCount;
+        }
+
+        function toggleDraw() {
+            if (state.isShowingWinner) return;
+
+            if (!state.isInitialized) {
+                initLottery();
+                if (!state.isInitialized) return;
+            }
+
+            if (state.isSpinning) {
+                stopAndSelect();
+            } else {
+                startSpin();
+            }
+        }
+
+        function startSpin() {
+            state.isSpinning = true;
+            state.targetSpeed = 0.32; // 加速旋转(已加快一倍)
+            document.getElementById('drawBtn').textContent = '停止';
+            document.getElementById('drawBtn').classList.add('stop');
+        }
+
+        function stopAndSelect() {
+            state.isSpinning = false;
+            state.targetSpeed = 0.002; // 减速
+
+            // 从剩余人员中随机选择
+            const remainingCards = cardObjects.filter(obj => !obj.userData.isWinner);
+            if (remainingCards.length === 0) return;
+
+            const winnerObj = remainingCards[Math.floor(Math.random() * remainingCards.length)];
+            selectWinner(winnerObj);
+        }
+
+        function selectWinner(winnerObj) {
+            state.isShowingWinner = true;
+            winnerObj.userData.isWinner = true;
+            winnerObj.element.classList.add('winner');
+
+            const winnerName = winnerObj.userData.name;
+
+            // 将卡片飞到屏幕中央
+            flyToCenter(winnerObj, () => {
+                // 显示中奖特写
+                showSpotlight(winnerName);
+
+                // 3秒后归位
+                setTimeout(() => {
+                    hideSpotlight();
+                    flyBack(winnerObj, () => {
+                        recordWinner(winnerName);
+                    });
+                }, 3000);
+            });
+        }
+
+        function flyToCenter(obj, callback) {
+            const targetPos = new THREE.Vector3(0, 0, 600);
+
+            new TWEEN.Tween(obj.position)
+                .to({ x: targetPos.x, y: targetPos.y, z: targetPos.z }, 800)
+                .easing(TWEEN.Easing.Cubic.Out)
+                .start();
+
+            new TWEEN.Tween(obj.rotation)
+                .to({ x: 0, y: Math.PI, z: 0 }, 800)
+                .easing(TWEEN.Easing.Cubic.Out)
+                .onComplete(callback)
+                .start();
+
+            // 卡片放大效果
+            const cardEl = obj.element;
+            cardEl.style.transform = 'scale(2)';
+            cardEl.style.transition = 'transform 0.8s cubic-bezier(0.175, 0.885, 0.32, 1.275)';
+        }
+
+        function flyBack(obj, callback) {
+            const origPos = obj.userData.originalPosition;
+            const origRot = obj.userData.originalRotation;
+
+            // 恢复卡片大小
+            obj.element.style.transform = 'scale(1)';
+
+            new TWEEN.Tween(obj.position)
+                .to({ x: origPos.x, y: origPos.y, z: origPos.z }, 600)
+                .easing(TWEEN.Easing.Cubic.InOut)
+                .start();
+
+            new TWEEN.Tween(obj.rotation)
+                .to({ x: origRot.x, y: origRot.y, z: origRot.z }, 600)
+                .easing(TWEEN.Easing.Cubic.InOut)
+                .onComplete(callback)
+                .start();
+        }
+
+        function showSpotlight(name) {
+            const overlay = document.getElementById('spotlightOverlay');
+            document.getElementById('spotlightName').textContent = name;
+
+            const prizeText = prizeLabels[state.currentPrize];
+            const prizeName = document.getElementById(state.currentPrize + 'Prize').value;
+            document.getElementById('spotlightPrize').textContent =
+                prizeName ? `${prizeText} - ${prizeName}` : prizeText;
+
+            overlay.classList.add('active');
+            createFireworks();
+        }
+
+        function hideSpotlight() {
+            document.getElementById('spotlightOverlay').classList.remove('active');
+        }
+
+        function recordWinner(name) {
+            // 记录中奖者
+            state.winners[state.currentPrize].push(name);
+            state.remaining[state.currentPrize]--;
+
+            // 更新中奖列表UI
+            const listEl = document.getElementById(state.currentPrize + 'Winners');
+            const tag = document.createElement('div');
+            tag.className = 'winner-tag';
+            tag.textContent = name;
+            tag.style.borderColor = prizeColors[state.currentPrize];
+            listEl.appendChild(tag);
+
+            // 更新计数(使用缓存的剩余人数)
+            state.remainingCount--;
+            document.getElementById('remainingCount').textContent = state.remainingCount;
+            updateResultCounts();
+
+            // 检查是否进入下一奖项
+            if (state.remaining[state.currentPrize] === 0) {
+                moveToNextPrize();
+            } else {
+                state.isShowingWinner = false;
+                document.getElementById('drawBtn').textContent = '开始抽奖';
+                document.getElementById('drawBtn').classList.remove('stop');
+            }
+        }
+
+        function moveToNextPrize() {
+            state.prizeIndex++;
+
+            // 跳过人数为0的奖项
+            while (state.prizeIndex < state.prizeOrder.length &&
+                state.remaining[state.prizeOrder[state.prizeIndex]] === 0) {
+                state.prizeIndex++;
+            }
+
+            if (state.prizeIndex >= state.prizeOrder.length) {
+                // 抽奖结束
+                finishLottery();
+            } else {
+                state.currentPrize = state.prizeOrder[state.prizeIndex];
+                state.isShowingWinner = false;
+                updatePrizeIndicator();
+                document.getElementById('drawBtn').textContent = '开始抽奖';
+                document.getElementById('drawBtn').classList.remove('stop');
+            }
+        }
+
+        function finishLottery() {
+            state.isInitialized = false;
+            state.isShowingWinner = false;
+            document.getElementById('drawBtn').disabled = true;
+            document.getElementById('drawBtn').textContent = '抽奖结束';
+            document.getElementById('drawBtn').classList.remove('stop');
+            document.getElementById('prizeIndicator').textContent = '🎉 抽奖完成';
+
+            // 导出中奖名单Excel
+            exportWinnerList();
+        }
+
+        async function exportWinnerList() {
+            const workbook = new ExcelJS.Workbook();
+            const ws = workbook.addWorksheet('中奖名单');
+
+            // 获取各奖项中奖者
+            const thirdWinners = state.winners.third;
+            const secondWinners = state.winners.second;
+            const firstWinners = state.winners.first;
+            const specialWinners = state.winners.special;
+
+            // 获取奖品名称
+            const thirdPrize = document.getElementById('thirdPrize').value || '';
+            const secondPrize = document.getElementById('secondPrize').value || '';
+            const firstPrize = document.getElementById('firstPrize').value || '';
+            const specialPrize = document.getElementById('specialPrize').value || '';
+
+            // 奖项标签
+            const thirdLabel = thirdPrize ? `三等奖-${thirdPrize}` : '三等奖';
+            const secondLabel = secondPrize ? `二等奖-${secondPrize}` : '二等奖';
+            const firstLabel = firstPrize ? `一等奖-${firstPrize}` : '一等奖';
+            const specialLabel = specialPrize ? `特等奖-${specialPrize}` : '特等奖';
+
+            // 找出最大中奖人数
+            const maxLen = Math.max(thirdWinners.length, secondWinners.length, firstWinners.length, specialWinners.length, 1);
+
+            // 奖项颜色
+            const colors = {
+                title: 'D9EAD3',
+                third: 'CCE5FF',
+                second: 'FFE5CC',
+                first: 'FFCCCC',
+                special: 'FFFACD'
+            };
+
+            // 设置列宽
+            ws.columns = [
+                { width: 8 }, { width: 12 },
+                { width: 8 }, { width: 12 },
+                { width: 8 }, { width: 12 },
+                { width: 8 }, { width: 12 }
+            ];
+
+            // 通用样式
+            const baseStyle = {
+                font: { name: '微软雅黑', size: 12 },
+                alignment: { horizontal: 'center', vertical: 'middle' },
+                border: {
+                    top: { style: 'thin' },
+                    left: { style: 'thin' },
+                    bottom: { style: 'thin' },
+                    right: { style: 'thin' }
+                }
+            };
+
+            // 第1行: 标题
+            ws.addRow(['中奖名单', '', '', '', '', '', '', '']);
+            ws.mergeCells('A1:H1');
+            const titleCell = ws.getCell('A1');
+            titleCell.font = { name: '微软雅黑', size: 12, bold: true };
+            titleCell.alignment = { horizontal: 'center', vertical: 'middle' };
+            titleCell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: colors.title } };
+            titleCell.border = baseStyle.border;
+
+            // 第2行: 奖项名称
+            ws.addRow([thirdLabel, '', secondLabel, '', firstLabel, '', specialLabel, '']);
+            ws.mergeCells('A2:B2');
+            ws.mergeCells('C2:D2');
+            ws.mergeCells('E2:F2');
+            ws.mergeCells('G2:H2');
+            ['A2', 'B2'].forEach(ref => {
+                const cell = ws.getCell(ref);
+                cell.font = baseStyle.font;
+                cell.alignment = baseStyle.alignment;
+                cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: colors.third } };
+                cell.border = baseStyle.border;
+            });
+            ['C2', 'D2'].forEach(ref => {
+                const cell = ws.getCell(ref);
+                cell.font = baseStyle.font;
+                cell.alignment = baseStyle.alignment;
+                cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: colors.second } };
+                cell.border = baseStyle.border;
+            });
+            ['E2', 'F2'].forEach(ref => {
+                const cell = ws.getCell(ref);
+                cell.font = baseStyle.font;
+                cell.alignment = baseStyle.alignment;
+                cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: colors.first } };
+                cell.border = baseStyle.border;
+            });
+            ['G2', 'H2'].forEach(ref => {
+                const cell = ws.getCell(ref);
+                cell.font = baseStyle.font;
+                cell.alignment = baseStyle.alignment;
+                cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: colors.special } };
+                cell.border = baseStyle.border;
+            });
+
+            // 第3行: 表头
+            ws.addRow(['序号', '姓名', '序号', '姓名', '序号', '姓名', '序号', '姓名']);
+            for (let c = 1; c <= 8; c++) {
+                const cell = ws.getCell(3, c);
+                cell.font = baseStyle.font;
+                cell.alignment = baseStyle.alignment;
+                cell.border = baseStyle.border;
+                if (c <= 2) cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: colors.third } };
+                else if (c <= 4) cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: colors.second } };
+                else if (c <= 6) cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: colors.first } };
+                else cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: colors.special } };
+            }
+
+            // 数据行
+            for (let i = 0; i < maxLen; i++) {
+                const row = [
+                    thirdWinners[i] ? i + 1 : '', thirdWinners[i] || '',
+                    secondWinners[i] ? i + 1 : '', secondWinners[i] || '',
+                    firstWinners[i] ? i + 1 : '', firstWinners[i] || '',
+                    specialWinners[i] ? i + 1 : '', specialWinners[i] || ''
+                ];
+                ws.addRow(row);
+                const rowNum = 4 + i;
+                for (let c = 1; c <= 8; c++) {
+                    const cell = ws.getCell(rowNum, c);
+                    cell.font = baseStyle.font;
+                    cell.alignment = baseStyle.alignment;
+                    if (cell.value !== '' && cell.value !== null && cell.value !== undefined) {
+                        cell.border = baseStyle.border;
+                        if (c <= 2) cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: colors.third } };
+                        else if (c <= 4) cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: colors.second } };
+                        else if (c <= 6) cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: colors.first } };
+                        else cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: colors.special } };
+                    }
+                }
+            }
+
+            // 导出文件
+            const buffer = await workbook.xlsx.writeBuffer();
+            const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+            const url = URL.createObjectURL(blob);
+            const link = document.createElement('a');
+            link.href = url;
+            link.download = '中奖名单.xlsx';
+            link.click();
+            URL.revokeObjectURL(url);
+        }
+
+        function updatePrizeIndicator() {
+            const el = document.getElementById('prizeIndicator');
+            const label = prizeLabels[state.currentPrize];
+            const remaining = state.remaining[state.currentPrize];
+            el.textContent = `正在抽取: ${label} (剩余 ${remaining} 人)`;
+            el.style.borderColor = prizeColors[state.currentPrize];
+            el.style.background = `linear-gradient(135deg, ${prizeColors[state.currentPrize]}33, ${prizeColors[state.currentPrize]}11)`;
+        }
+
+        function updateResultCounts() {
+            ['special', 'first', 'second', 'third'].forEach(key => {
+                const won = state.winners[key].length;
+                const total = (parseInt(document.getElementById(key + 'Count').value) || 0);
+                document.getElementById(key + 'ResultCount').textContent = `${won}/${total}`;
+
+                // 更新奖项标题显示奖品名称
+                const prizeName = document.getElementById(key + 'Prize').value;
+                const titleEl = document.getElementById(key + 'Title');
+                const baseLabel = prizeLabels[key];
+                titleEl.textContent = prizeName ? `${baseLabel}-${prizeName}` : baseLabel;
+            });
+        }
+
+        function resetAll() {
+            if (!confirm('确定要重置所有数据吗？')) return;
+            location.reload();
+        }
+
+        // ========== 烟花特效 ==========
+        function createFireworks() {
+            const colors = ['#FF3B30', '#FF9500', '#FFCC00', '#34C759', '#5AC8FA', '#007AFF', '#AF52DE', '#FF2D55'];
+            const fragment = document.createDocumentFragment();
+
+            for (let i = 0; i < 30; i++) {
+                const particle = document.createElement('div');
+                particle.className = 'particle';
+                particle.style.cssText = `left:50%;top:50%;background:${colors[i % 8]};box-shadow:0 0 6px ${colors[i % 8]}`;
+                fragment.appendChild(particle);
+
+                const angle = Math.random() * Math.PI * 2;
+                const velocity = 100 + Math.random() * 200;
+                const tx = Math.cos(angle) * velocity;
+                const ty = Math.sin(angle) * velocity;
+
+                requestAnimationFrame(() => {
+                    particle.animate([
+                        { transform: 'translate(-50%, -50%) scale(1)', opacity: 1 },
+                        { transform: `translate(calc(-50% + ${tx}px), calc(-50% + ${ty}px)) scale(0)`, opacity: 0 }
+                    ], {
+                        duration: 800 + Math.random() * 400,
+                        easing: 'cubic-bezier(0, 0.5, 0.5, 1)'
+                    }).onfinish = () => particle.remove();
+                });
+            }
+            document.body.appendChild(fragment);
+        }
+
+        // ========== 星空背景 ==========
+        function createStars() {
+            const container = document.getElementById('stars');
+            const fragment = document.createDocumentFragment();
+            for (let i = 0; i < 60; i++) {
+                const star = document.createElement('div');
+                star.className = 'star';
+                const size = (1 + Math.random() * 2) + 'px';
+                star.style.cssText = `left:${Math.random() * 100}%;top:${Math.random() * 100}%;animation-delay:${Math.random() * 3}s;width:${size};height:${size}`;
+                fragment.appendChild(star);
+            }
+            container.appendChild(fragment);
+        }
+
+        // ========== 键盘事件 ==========
+        document.addEventListener('keydown', (e) => {
+            if (e.target.tagName === 'INPUT') return;
+            if (e.code === 'Space') {
+                e.preventDefault();
+                if (state.isInitialized && !state.isShowingWinner) {
+                    toggleDraw();
+                }
+            }
+        });
+
+        // ========== 初始化 ==========
+        createStars();
+        initThree();
+        document.getElementById('remainingCount').textContent = available.length;
+
+        // 暴露到全局
+        window.toggleDraw = toggleDraw;
+        window.resetAll = resetAll;
+
+        // ========== 导入导出功能 ==========
+        window.downloadTemplate = function () {
+            const wb = XLSX.utils.book_new();
+            const data = [["序号", "姓名"]];
+            for (let i = 1; i <= 10; i++) {
+                data.push([String(i).padStart(2, '0'), ""]);
+            }
+            const ws = XLSX.utils.aoa_to_sheet(data);
+            ws['!cols'] = [{ wch: 10 }, { wch: 20 }];
+            XLSX.utils.book_append_sheet(wb, ws, "抽奖名单");
+            XLSX.writeFile(wb, "抽奖名单模板.xlsx");
+        };
+
+        window.importList = function (input) {
+            const file = input.files[0];
+            if (!file) return;
+            const reader = new FileReader();
+            reader.onload = function (e) {
+                const data = new Uint8Array(e.target.result);
+                const workbook = XLSX.read(data, { type: 'array' });
+                const sheet = workbook.Sheets[workbook.SheetNames[0]];
+                const json = XLSX.utils.sheet_to_json(sheet, { header: 1 });
+                const names = [];
+                for (let i = 1; i < json.length; i++) {
+                    const row = json[i];
+                    if (row && row[1] && String(row[1]).trim()) {
+                        names.push(String(row[1]).trim());
+                    }
+                }
+                if (names.length > 0) {
+                    available = names;
+                    state.isInitialized = false;
+                    state.winners = { special: [], first: [], second: [], third: [] };
+                    createCards();
+                    document.getElementById('remainingCount').textContent = available.length;
+                    document.getElementById('prizeIndicator').textContent = '准备开始';
+                    document.getElementById('drawBtn').disabled = false;
+                    document.getElementById('drawBtn').textContent = '开始抽奖';
+                    ['special', 'first', 'second', 'third'].forEach(key => {
+                        document.getElementById(key + 'Winners').innerHTML = '';
+                        document.getElementById(key + 'ResultCount').textContent = '0/0';
+                    });
+                }
+                input.value = '';
+            };
+            reader.readAsArrayBuffer(file);
+        };
+    </script>
+</body>
+
+</html>
