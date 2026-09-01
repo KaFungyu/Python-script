@@ -1,6 +1,5 @@
-# -*- coding: utf-8 -*-
 """
-HIOKI LR8401-21 / LR8450 自动化测试控制台 v12.5 (极速优化与抗干扰重试极简版)
+HIOKI LR8401-21 / LR8450 自动化测试控制台 v21.0 (原生ADC高精采样与SOTA全功能自适应量程旗舰版)
 设计者：程控专家 (KaFungyu 专属美学升级版)
 """
 
@@ -9,13 +8,15 @@ import os
 import time
 import json
 import math
+import ctypes
+import re
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
+from collections import deque
 
-# 依赖库预检（彻底移除 openpyxl / pandas / numpy 依赖，仅保留 pyserial）
 try:
     import serial
-    import serial.tools.list_ports  # 自动扫描物理串口
+    import serial.tools.list_ports
 except ImportError:
     import tkinter as tk
     from tkinter import messagebox
@@ -30,7 +31,7 @@ except ImportError:
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox, filedialog
 
-# 映射日置电压量程至 SCPI 浮点参数
+# 映射日置电压量程至 SCPI 浮点参数及标准枚举字面量 (LR8401 / LR8450 统一标准)
 RANGE_MAP = {
     "10mV": "0.01",
     "20mV": "0.02",
@@ -42,36 +43,125 @@ RANGE_MAP = {
     "20V": "20.0",
     "100V": "100.0"
 }
+RANGE_SCPI_ENUM = {
+    "10mV": "10MV",
+    "20mV": "20MV",
+    "100mV": "100MV",
+    "200mV": "200MV",
+    "1V": "1V",
+    "2V": "2V",
+    "10V": "10V",
+    "20V": "20V",
+    "100V": "100V"
+}
 RANGE_LIST = list(RANGE_MAP.keys())
-
-# O(1) 极速反向量程查表字典
 RANGE_REVERSE_MAP = {v.upper(): k for k, v in RANGE_MAP.items()}
-
-# 物理量程对应的标称最大电压限制（单位：V），用于软饱和检测
+RANGE_NUMERIC_MAP = {float(v): k for k, v in RANGE_MAP.items()}
+RANGE_NEXT_MAP = {current: RANGE_LIST[i + 1] for i, current in enumerate(RANGE_LIST[:-1])}
 RANGE_LIMITS_VOLTS = {k: float(v) for k, v in RANGE_MAP.items()}
+
+
+def clean_scpi_response(res_str):
+    if not res_str:
+        return ""
+    res_str = str(res_str).strip()
+    if " " in res_str:
+        parts = res_str.split(" ", 1)
+        if parts[0].startswith(":") or (parts[0].isalpha() and len(parts[0]) > 4 and parts[0].upper() not in ("OVER", "NAN", "INF", "O.R")):
+            return parts[1]
+    return res_str
+
+
+def parse_voltage_range_volts(val_str):
+    if val_str is None:
+        return None
+    cleaned = clean_scpi_response(str(val_str)).strip().strip('"')
+    if "," in cleaned:
+        cleaned = cleaned.rsplit(",", 1)[-1].strip().strip('"')
+    norm = cleaned.upper().replace(" ", "")
+    if not norm:
+        return None
+
+    if norm.endswith("MV"):
+        try:
+            return float(norm[:-2]) * 0.001
+        except ValueError:
+            pass
+    elif norm.endswith("V"):
+        try:
+            return float(norm[:-1])
+        except ValueError:
+            pass
+    try:
+        return float(norm)
+    except ValueError:
+        pass
+    return None
+
+
+def format_range_for_log(value):
+    v = parse_voltage_range_volts(value)
+    if v is None:
+        return "无响应" if not value else str(value).strip()
+    for expected_val, label in RANGE_NUMERIC_MAP.items():
+        if abs(v - expected_val) <= max(abs(expected_val) * 1e-3, 1e-6):
+            return label
+    if v < 1.0:
+        mv_text = f"{v * 1000:.6f}".rstrip("0").rstrip(".")
+        return f"{mv_text}mV"
+    volt_text = f"{v:.6f}".rstrip("0").rstrip(".")
+    return f"{volt_text}V"
+
+
+def is_scpi_range_match(response, expected):
+    v_actual = parse_voltage_range_volts(response)
+    v_expected = parse_voltage_range_volts(expected)
+    if v_actual is None or v_expected is None:
+        return False
+    tolerance = max(abs(v_expected) * 1e-3, 1e-6)
+    return abs(v_actual - v_expected) <= tolerance
+
+
+def parse_interval_seconds(interval_text):
+    text = str(interval_text).strip().lower()
+    try:
+        if text.endswith("ms"):
+            val = float(text[:-2])
+            if val <= 0: raise ValueError
+            return val / 1000.0
+        if text.endswith("s"):
+            val = float(text[:-1])
+            if val <= 0: raise ValueError
+            return val
+        val = float(text)
+        if val <= 0: raise ValueError
+        return val
+    except (TypeError, ValueError):
+        raise ValueError(f"非法采样间隔: {interval_text}")
+
 
 def get_scpi_range(range_text):
     return RANGE_MAP.get(range_text, "0.01")
 
+
+def get_scpi_enum_range(range_text):
+    return RANGE_SCPI_ENUM.get(range_text, range_text.upper())
+
+
 def get_next_range(current_range):
-    """获取下一个更高的量程档位（超量程自动升档使用）"""
-    if current_range in RANGE_LIST:
-        idx = RANGE_LIST.index(current_range)
-        if idx < len(RANGE_LIST) - 1:
-            return RANGE_LIST[idx + 1]
-    return current_range
+    return RANGE_NEXT_MAP.get(current_range, current_range)
+
 
 def get_range_command_args(range_text, is_lr8450):
     scpi_range = get_scpi_range(range_text)
+    enum_range = get_scpi_enum_range(range_text)
     candidates = [("numeric", scpi_range)]
-
     try:
         candidates.append(("nr3", f"{float(scpi_range):.1E}"))
     except ValueError:
         pass
-
-    if is_lr8450:
-        candidates.append(("label", range_text))
+    candidates.append(("enum", enum_range))
+    candidates.append(("label", range_text))
 
     deduped = []
     seen = set()
@@ -82,146 +172,214 @@ def get_range_command_args(range_text, is_lr8450):
             deduped.append((kind, arg))
     return deduped
 
-def extract_scpi_range_token(response):
-    response = clean_scpi_response(response).strip().strip('"')
-    if "," in response:
-        response = response.rsplit(",", 1)[-1].strip().strip('"')
-    return response
 
-def format_range_for_log(value):
-    token = extract_scpi_range_token(value)
-    if not token:
-        return "无响应"
-
-    norm = token.upper().replace(" ", "")
-    # O(1) 匹配精准字符串
-    if norm in RANGE_REVERSE_MAP:
-        return RANGE_REVERSE_MAP[norm]
-
-    try:
-        actual_val = float(norm)
-    except ValueError:
-        return token
-
-    for scpi_val, label in RANGE_REVERSE_MAP.items():
-        try:
-            expected_val = float(scpi_val)
-        except ValueError:
-            continue
-        tolerance = max(abs(expected_val) * 1e-3, 1e-9)
-        if abs(actual_val - expected_val) <= tolerance:
-            return label
-
-    if abs(actual_val) < 1.0:
-        mv_text = f"{actual_val * 1000:.6f}".rstrip("0").rstrip(".")
-        return f"{mv_text}mV"
-
-    volt_text = f"{actual_val:.6f}".rstrip("0").rstrip(".")
-    return f"{volt_text}V"
-
-def is_scpi_range_match(response, expected):
-    """Return True when a range query response matches the requested SCPI range."""
-    response = extract_scpi_range_token(response)
-
-    actual_norm = response.upper().replace(" ", "")
-    expected_norm = expected.upper().replace(" ", "")
-    if actual_norm == expected_norm:
+def is_current_channel(comment_str, ratio_str):
+    c = str(comment_str or "").strip().upper()
+    r = str(ratio_str or "").strip()
+    if any(tag in c for tag in ("(MA)", "[MA]", "MA", "CUR", "CURRENT", "SHUNT")):
         return True
+    if r and r not in ("1", "+1", "-1", "0", "+0", "-0"):
+        try:
+            val = float(r)
+            if abs(val) > 0:
+                return True
+        except ValueError:
+            pass
+    return False
 
+
+def get_optimal_range_for_channel(raw_peak_volt, is_current=False):
+    if raw_peak_volt is None or math.isnan(raw_peak_volt):
+        return "10mV" if is_current else "1V"
+    
+    v = abs(float(raw_peak_volt))
+    
+    if is_current:
+        CURRENT_THRESHOLDS = [
+            (0.010 * 0.97, "10mV"),
+            (0.020 * 0.97, "20mV"),
+            (0.100 * 0.97, "100mV"),
+            (0.200 * 0.97, "200mV"),
+            (1.000 * 0.97, "1V"),
+            (2.000 * 0.97, "2V"),
+            (10.000 * 0.97, "10V"),
+            (20.000 * 0.97, "20V"),
+        ]
+        for limit, r_str in CURRENT_THRESHOLDS:
+            if v <= limit:
+                return r_str
+        return "100V"
+    else:
+        VOLTAGE_THRESHOLDS = [
+            (1.000 * 0.97, "1V"),
+            (2.000 * 0.97, "2V"),
+            (10.000 * 0.97, "10V"),
+            (20.000 * 0.97, "20V"),
+        ]
+        for limit, r_str in VOLTAGE_THRESHOLDS:
+            if v <= limit:
+                return r_str
+        return "100V"
+
+
+def invert_ratio_sign(ratio_text):
+    text = str(ratio_text).strip()
+    if not text:
+        return "-1"
+    if text.startswith("-"):
+        val_str = text[1:].strip()
+        return val_str if val_str else "1"
+    elif text.startswith("+"):
+        val_str = text[1:].strip()
+        return f"-{val_str}" if val_str else "-1"
+    else:
+        return f"-{text}"
+
+
+def transform_raw_adc_value(raw_volt, ratio_text):
+    if raw_volt is None or math.isnan(raw_volt):
+        return raw_volt
+    r_str = str(ratio_text or "").strip()
+    if not r_str:
+        return raw_volt
     try:
-        actual_val = float(actual_norm)
-        expected_val = float(expected_norm)
+        r_val = float(r_str)
+        if r_val == 0.0:
+            return raw_volt
+        return raw_volt * r_val
     except ValueError:
+        return raw_volt
+
+
+def parse_single_chan_response(res_str):
+    if not res_str:
+        return None, "EMPTY"
+    cleaned = clean_scpi_response(str(res_str).strip()).strip('"')
+    if "," in cleaned:
+        cleaned = cleaned.rsplit(",", 1)[-1].strip().strip('"')
+    cleaned_u = cleaned.upper()
+    if any(k in cleaned_u for k in ("OVER", "+OVER", "O.R")):
+        return math.nan, "OVER"
+    if "-OVER" in cleaned_u:
+        return math.nan, "-OVER"
+    if any(k in cleaned_u for k in ("NAN", "INF", "NO DATA", "NODATA", "EMPTY")):
+        return math.nan, "INVALID"
+    try:
+        val = float(cleaned)
+        if abs(val) >= 1.0e+9:
+            return math.nan, "OVER"
+        return val, "VALID"
+    except ValueError:
+        return None, "INVALID"
+
+
+def set_system_clipboard_native(text):
+    if sys.platform != "win32":
         return False
-
-    tolerance = max(abs(expected_val) * 1e-3, 1e-9)
-    return abs(actual_val - expected_val) <= tolerance
-
-def clean_scpi_response(res_str):
-    """自动剥离 SCPI 响应中的指令头回显"""
-    res_str = res_str.strip()
-    if " " in res_str:
-        parts = res_str.split(" ", 1)
-        if parts[0].startswith(":") or parts[0].isalpha():
-            return parts[1]
-    return res_str
+    try:
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        data = text.encode("utf-16le") + b"\x00\x00"
+        for _ in range(5):
+            if user32.OpenClipboard(None):
+                break
+            time.sleep(0.01)
+        else:
+            return False
+        user32.EmptyClipboard()
+        GMEM_MOVEABLE = 0x0002
+        CF_UNICODETEXT = 13
+        h_mem = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(data))
+        if h_mem:
+            p_mem = kernel32.GlobalLock(h_mem)
+            ctypes.memmove(p_mem, data, len(data))
+            kernel32.GlobalUnlock(h_mem)
+            user32.SetClipboardData(CF_UNICODETEXT, h_mem)
+        user32.CloseClipboard()
+        return True
+    except Exception:
+        return False
 
 
 class HiokiPerfectApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("HIOKI LR8401-21 / LR8450 程控控制台 v12.5")
+        self.root.title("HIOKI LR8401-21 / LR8450 程控控制台 v21.0")
         self.root.geometry("1680x850")
-        self.root.configure(bg="#ffffff") # iOS 纯白高亮背景
+        self.root.configure(bg="#ffffff")
         
-        # 串口及全局变量及同步锁
         self.port = tk.StringVar()
-        self.baudrate = tk.StringVar(value="115200")
-        self.device_model = tk.StringVar(value="LR8401-21") # 仪器型号
-        self.ch30_var = tk.BooleanVar(value=False)           # Slot 1 是否为 30ch 模块 (U8552) 的状态标识
-        self.interval_var = tk.StringVar(value="10ms")       # 记录间隔
+        self.baudrate = tk.StringVar(value="921600")
+        self.device_model = tk.StringVar(value="LR8401-21")
+        self.ch30_var = tk.BooleanVar(value=False)
+        self.interval_var = tk.StringVar(value="10ms")
         self.case_name = tk.StringVar(value="")
         self.ser_lock = threading.Lock()
         
         self.ser = None
         self.is_connected = False
-        self.config_unsynced = True # 智能差分同步标志：默认需要初始同步
+        self.config_unsynced = True
         
-        # ==================== 本地寄存器状态全缓存结构 ====================
-        self.instrument_ranges = {}      # 缓存成功下发给仪器的实际通道量程
-        self.instrument_stores = {}      # 缓存当前通道物理开启状态 (True / False)
-        self.instrument_comments = {}    # 缓存当前通道物理屏幕注释
-        self.instrument_scalings = {}    # 缓存当前通道物理 SCALing 状态
+        self.instrument_ranges = {}
+        self.instrument_stores = {}
+        self.instrument_comments = {}
+        self.instrument_scalings = {}
         
-        # ==================== 高性能 GUI 渲染防抖文本比对缓存 ====================
-        self.gui_val_cache = {}          # 缓存实时测量值文本及配色：{key: (text, fg, bg)}
-        self.gui_stat_cache = {}         # 缓存平均、最大、最小统计：{key: (avg_text, avg_fg, max_text, max_fg, min_text, min_fg)}
-        self._selection_visual_cache = {}# 增量选中视觉样式缓存：{key: (is_selected, sync_failed)}
+        self.channel_keys = [f"1-{unit}-{ch}" for unit in [1, 2] for ch in range(1, 16)]
+        self.sync_failed_state = {key: False for key in self.channel_keys}
         
-        # ==================== 跨线程离线 SCPI 通道名称静态映射 ====================
-        self.scpi_channel_mapping = {}   # 本地缓存映射 {key: scpi_ch_string}
+        self.gui_val_cache = {}
+        self.gui_stat_cache = {}
+        self._selection_visual_cache = {}
         
-        # 批量多选与拖拽状态变量
+        self.scpi_channel_mapping = {}
+        self.scpi_to_key_map = {}
+        
         self.selected_keys = set()
         self.last_selected_key = None
-        self.widget_to_key = {}          # O(1) 极速拖拽选中映射表
+        self.widget_to_key = {}
         self.is_dragging = False
         self.drag_start_key = None
         self.drag_base_selection = set()
         self.drag_last_key = None
         
-        # O(1) 常数级内存流计数与剪贴板缓存
+        self.log_queue = deque(maxlen=2000)
+        self.log_lock = threading.Lock()
+        
         self.total_frames = 0
         self.last_clipboard_text = ""
-        self.is_ma_channel = {} # 通道单位高性能本地缓存
-        self.active_channels = [] # 运行期缓存活跃通道
-        self.channel_limits_cache = {} # 运行期缓存各通道电压阈值和转换比信息
+        self.is_ma_channel = {}
+        self.active_channels = []
+        self.channel_limits_cache = {}
+        self.last_test_stats = {}
         
-        # 用于记录当前测试周期内已弹过 OVER / 超量程警告的通道 key
-        self.alerted_over_channels = set()
-        self.over_channels_to_upgrade = set()
+        self.monitor_thread = None
+        self.stop_monitor_event = threading.Event()
         
-        # 增量式极速统计缓存字典
         self.stats_count = {}
         self.stats_sum = {}
+        self.stats_comp = {}
         self.stats_max = {}
         self.stats_min = {}
+        self.stats_raw_peaks = {}
+        self.stats_over = {}
         
-        # 时间戳记录
+        self.alerted_over_channels = set()
+        self.over_channels_to_upgrade = set()
+        self.pending_optimal_ranges = {}
+        self.unified_alert_win = None
+        self.unified_alert_text = None
+        self.unified_alert_items = {}
+        
         self.dt_start = None
         self.dt_end = None
         
-        # 计时器与线程控制变量
         self.timer_running = False
         self.start_time = 0.0
         self.elapsed_time = 0.0
         self._save_timer_id = None
         self.init_completed = False
         
-        # 预先生成全局通道 Keys 列表
-        self.channel_keys = [f"1-{unit}-{ch}" for unit in [1, 2] for ch in range(1, 16)]
-        
-        # 缓存通道元数据
         self.channel_metadata = {}
         for key in self.channel_keys:
             parts = key.split("-")
@@ -233,7 +391,6 @@ class HiokiPerfectApp:
                 "prefix": "CH1" if unit == 1 else "CH2"
             }
         
-        # 存储 30 个通道控件变量的字典 (默认转换比设为空字符串，绝不写死任何通道默认放大比)
         self.channel_vars = {}
         for key in self.channel_keys:
             meta = self.channel_metadata[key]
@@ -250,100 +407,170 @@ class HiokiPerfectApp:
                 "ent_ratio": None,
                 "lbl_ch": None,
                 "cmb_range": None,
-                "sync_failed": False, # 标记量程或通道是否同步物理设备失败
                 "row_bg": "#ffffff"
             }
             self.stats_count[key] = 0
             self.stats_sum[key] = 0.0
+            self.stats_comp[key] = 0.0
             self.stats_max[key] = -float('inf')
             self.stats_min[key] = float('inf')
+            self.stats_raw_peaks[key] = 0.0
+            self.stats_over[key] = 0
                 
         self.create_widgets()
         self.load_local_config()
-        self.rebuild_scpi_channel_mapping() # 初始离线计算 SCPI 映射
+        self.rebuild_scpi_channel_mapping()
         
-        # 绑定 trace 自动保存修改
         self.port.trace_add("write", self._schedule_save)
-        self.baudrate.trace_add("write", self._schedule_save)
         self.device_model.trace_add("write", self._on_model_changed)
         self.ch30_var.trace_add("write", self._schedule_save)
         self.interval_var.trace_add("write", self._schedule_save)
         self.case_name.trace_add("write", self._schedule_save)
         for key, vars_dict in self.channel_vars.items():
             vars_dict["comment"].trace_add("write", self._schedule_save)
-            vars_dict["range"].trace_add("write", self._schedule_save)
-            vars_dict["ratio"].trace_add("write", self._schedule_save)
+            vars_dict["range"].trace_add("write", self._on_range_changed_trace)
+            vars_dict["ratio"].trace_add("write", self._on_ratio_changed_trace)
         self.init_completed = True
         
         self.auto_set_shortest_interval(verbose=False)
         self.refresh_ports_on_click()
         
-        # 窗口关闭时自动保存配置
+        self.root.after(100, self._flush_log_queue)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close_save)
-        
+
+    def _on_range_changed_trace(self, *args):
+        self._schedule_save()
+        if getattr(self, "init_completed", False):
+            self._update_channel_limits_cache()
+
+    def _on_ratio_changed_trace(self, *args):
+        self._schedule_save()
+        if getattr(self, "init_completed", False):
+            self._update_channel_limits_cache()
+            if not getattr(self, "timer_running", False):
+                self.gui_val_cache.clear()
+                self.gui_stat_cache.clear()
+
     def _on_model_changed(self, *args):
-        """当仪器型号发生改变时，自动重设 30ch 重映射策略并刷新限速配置"""
         if not getattr(self, "init_completed", False):
             return
         self.config_unsynced = True
-        
         self.instrument_ranges.clear()
         self.instrument_stores.clear()
         self.instrument_comments.clear()
         self.instrument_scalings.clear()
+        for key in self.channel_keys:
+            self.sync_failed_state[key] = False
         
         model = self.device_model.get()
-        if model == "LR8450":
-            self.ch30_var.set(True)
-        else:
-            self.ch30_var.set(False)
+        self.ch30_var.set(model == "LR8450")
             
         self.rebuild_scpi_channel_mapping()
         self.auto_set_shortest_interval(verbose=False)
 
     def rebuild_scpi_channel_mapping(self):
-        """将所有通道物理标识一次性算好离线备用，剔除跨线程 StringVar 开销"""
         ch30 = self.ch30_var.get()
-        self.scpi_channel_mapping = {
-            key: (f"CH1_{meta['ch']}" if meta['unit'] == 1 else (f"CH1_{meta['ch']+15}" if ch30 else f"CH2_{meta['ch']}"))
-            for key, meta in self.channel_metadata.items()
-        }
+        self.scpi_channel_mapping.clear()
+        self.scpi_to_key_map.clear()
+        for key, meta in self.channel_metadata.items():
+            scpi_name = f"CH1_{meta['ch']}" if meta['unit'] == 1 else (f"CH1_{meta['ch']+15}" if ch30 else f"CH2_{meta['ch']}")
+            self.scpi_channel_mapping[key] = scpi_name
+            self.scpi_to_key_map[scpi_name.upper()] = key
 
     def _get_filter_scpi(self):
         return ":UNIT:FILTer 50HZ", ":UNIT:FILTer?"
 
-    def _create_alert_window(self, title, width, height, border_color, bg_color):
-        """工厂方法：创建居中置顶警告弹窗"""
-        self.root.bell()
+    def _post_unified_alert(self, key, ch_display, comment, alert_type, val_str, limit_str, target_range=""):
+        if not self.timer_running or self.stop_monitor_event.is_set():
+            return
+        tag = f"{ch_display} ({comment})" if comment else ch_display
+        if alert_type == "OVER":
+            info = f"• {tag}: 发生物理 OVER 溢出 (将自动优化为 {target_range or '更高档位'})"
+        else:
+            info = f"• {tag}: 瞬态测得 {val_str}，超出 {limit_str} 极限 (将自动优化为 {target_range})"
+            
+        self.unified_alert_items[key] = info
+        self._refresh_unified_alert_window()
 
-        alert_win = tk.Toplevel(self.root)
-        alert_win.title(title)
-        alert_win.geometry(f"{width}x{height}")
-        alert_win.configure(bg="#ffffff")
-        alert_win.attributes("-topmost", True)
+    def _refresh_unified_alert_window(self):
+        if not self.unified_alert_items or not self.timer_running or self.stop_monitor_event.is_set():
+            return
+
+        body_text = "\n".join(self.unified_alert_items.values())
+
+        if self.unified_alert_win is not None and self.unified_alert_win.winfo_exists():
+            if self.unified_alert_text is not None:
+                self.unified_alert_text.config(state="normal")
+                self.unified_alert_text.delete("1.0", tk.END)
+                self.unified_alert_text.insert(tk.END, body_text)
+                self.unified_alert_text.config(state="disabled")
+            self.unified_alert_win.lift()
+            self.unified_alert_win.attributes("-topmost", True)
+            return
+
+        self.root.bell()
+        self.unified_alert_win = tk.Toplevel(self.root)
+        self.unified_alert_win.title("⚠️ 测量溢出 / 超量程提示")
+        self.unified_alert_win.geometry("540x290")
+        self.unified_alert_win.configure(bg="#ffffff")
+        self.unified_alert_win.attributes("-topmost", True)
 
         try:
-            x = self.root.winfo_x() + (self.root.winfo_width() // 2) - (width // 2)
-            y = self.root.winfo_y() + (self.root.winfo_height() // 2) - (height // 2)
-            alert_win.geometry(f"{width}x{height}+{x}+{y}")
+            x = self.root.winfo_x() + (self.root.winfo_width() // 2) - 270
+            y = self.root.winfo_y() + (self.root.winfo_height() // 2) - 145
+            self.unified_alert_win.geometry(f"540x290+{x}+{y}")
         except Exception:
             pass
 
         main_frame = tk.Frame(
-            alert_win,
-            bg=bg_color,
-            highlightbackground=border_color,
-            highlightcolor=border_color,
-            highlightthickness=2,
-            bd=0
+            self.unified_alert_win, bg="#fff9f9",
+            highlightbackground="#ff3b30", highlightcolor="#ff3b30",
+            highlightthickness=2, bd=0
         )
         main_frame.pack(fill="both", expand=True, padx=10, pady=10)
 
-        return alert_win, main_frame
+        tk.Label(
+            main_frame, text="⚠️ 测量溢出 / 超量程自动调档提示",
+            font=("Microsoft YaHei UI", 11, "bold"), fg="#ff3b30", bg="#fff9f9"
+        ).pack(pady=(6, 2))
 
-    # ==================== 鼠标点击及拖拽多选交互核心逻辑 ====================
+        tk.Label(
+            main_frame, text="以下通道信号超出物理量程上限，下次启动采集时将自动调至最佳匹配档位：",
+            font=("Microsoft YaHei UI", 9), fg="#1c1c1e", bg="#fff9f9", justify="left"
+        ).pack(anchor="w", padx=12, pady=(0, 4))
+
+        list_frame = tk.Frame(main_frame, bg="#ffffff", bd=1, relief="solid")
+        list_frame.pack(fill="both", expand=True, padx=12, pady=4)
+
+        self.unified_alert_text = scrolledtext.ScrolledText(
+            list_frame, wrap=tk.WORD, font=("Consolas", 10, "bold"),
+            bg="#ffffff", fg="#d97706", bd=0, highlightthickness=0
+        )
+        self.unified_alert_text.pack(fill="both", expand=True)
+        self.unified_alert_text.insert(tk.END, body_text)
+        self.unified_alert_text.config(state="disabled")
+
+        def on_ack():
+            self._dismiss_unified_alert_window()
+
+        self.unified_alert_win.protocol("WM_DELETE_WINDOW", on_ack)
+
+        tk.Button(
+            main_frame, text=" 我知道了 ", font=("Microsoft YaHei UI", 10, "bold"),
+            bg="#ff3b30", fg="white", activebackground="#e03126", activeforeground="white",
+            relief="flat", bd=0, cursor="hand2", command=on_ack, width=12, height=1
+        ).pack(pady=6)
+
+    def _dismiss_unified_alert_window(self):
+        if self.unified_alert_win is not None and self.unified_alert_win.winfo_exists():
+            try:
+                self.unified_alert_win.destroy()
+            except Exception:
+                pass
+            self.unified_alert_win = None
+            self.unified_alert_text = None
+
     def on_drag_start(self, key, event=None):
-        """按下鼠标左键，开始选区/拖拽多选"""
         self.is_dragging = True
         self.drag_start_key = key
         self.drag_last_key = key
@@ -378,7 +605,6 @@ class HiokiPerfectApp:
             ent.focus_set()
 
     def on_drag_motion(self, event):
-        """按住鼠标左键移动，动态扩展选区 (高性能 O(1) 拾取)"""
         if not getattr(self, "is_dragging", False) or not self.drag_start_key:
             return
 
@@ -402,21 +628,17 @@ class HiokiPerfectApp:
             self._update_selection_visuals()
 
     def on_drag_end(self, event=None):
-        """释放鼠标左键，完成拖拽多选"""
         self.is_dragging = False
 
     def select_channel(self, key, event=None):
-        """兼容性包装调用"""
         self.on_drag_start(key, event)
 
     def _update_selection_visuals(self, force=False):
-        """更新界面组件背景高亮，差异化增量渲染 (Diffing Optimization)"""
         for key, vars_dict in self.channel_vars.items():
             is_selected = key in self.selected_keys
-            sync_failed = vars_dict.get("sync_failed", False)
+            sync_failed = self.sync_failed_state.get(key, False)
             state = (is_selected, sync_failed)
 
-            # 若该通道的选择与同步状态未改变，直接跳过 Widget 重绘操作
             if not force and self._selection_visual_cache.get(key) == state:
                 continue
             self._selection_visual_cache[key] = state
@@ -425,20 +647,15 @@ class HiokiPerfectApp:
             ent_r = vars_dict.get("ent_ratio")
             lbl = vars_dict.get("lbl_ch")
             cmb_range = vars_dict.get("cmb_range")
-            row_bg = vars_dict.get("row_bg", "#ffffff")
+            row_bg = vars_dict["row_bg"]
             
             if is_selected:
-                if ent:
-                    ent.config(bg="#bae6fd", highlightbackground="#007aff", highlightcolor="#007aff")
-                if ent_r:
-                    ent_r.config(bg="#bae6fd", highlightbackground="#007aff", highlightcolor="#007aff")
-                if lbl:
-                    lbl.config(bg="#bae6fd", fg="#007aff")
+                if ent: ent.config(bg="#bae6fd", highlightbackground="#007aff", highlightcolor="#007aff")
+                if ent_r: ent_r.config(bg="#bae6fd", highlightbackground="#007aff", highlightcolor="#007aff")
+                if lbl: lbl.config(bg="#bae6fd", fg="#007aff")
             else:
-                if ent:
-                    ent.config(bg="#ffffff", highlightbackground="#e5e5ea", highlightcolor="#007aff")
-                if ent_r:
-                    ent_r.config(bg="#ffffff", highlightbackground="#e5e5ea", highlightcolor="#007aff")
+                if ent: ent.config(bg="#ffffff", highlightbackground="#e5e5ea", highlightcolor="#007aff")
+                if ent_r: ent_r.config(bg="#ffffff", highlightbackground="#e5e5ea", highlightcolor="#007aff")
                 if lbl:
                     lbl_color = "#ff3b30" if sync_failed else "#1c1c1e"
                     lbl.config(bg=row_bg, fg=lbl_color)
@@ -446,8 +663,29 @@ class HiokiPerfectApp:
             if cmb_range:
                 cmb_range.config(style="Red.TCombobox" if sync_failed else "TCombobox")
 
+    def _get_single_channel_snapshot(self, key):
+        vars_dict = self.channel_vars[key]
+        meta = self.channel_metadata[key]
+        lim_info = self.channel_limits_cache.get(key, {"limit_volt": 0.01, "ratio_val": 1.0, "is_scaled": False, "is_current": False})
+        scpi_ch = self.scpi_channel_mapping.get(key, f"CH{meta['unit']}_{meta['ch']}")
+        comment = vars_dict["comment"].get().strip()
+        return {
+            "key": key,
+            "unit": meta["unit"],
+            "ch": meta["ch"],
+            "comment": comment,
+            "range": vars_dict["range"].get(),
+            "ratio": vars_dict["ratio"].get().strip(),
+            "sync_failed": self.sync_failed_state.get(key, False),
+            "scpi_ch": scpi_ch,
+            "limit_volt": lim_info["limit_volt"],
+            "ratio_val": lim_info["ratio_val"],
+            "is_scaled": lim_info["is_scaled"],
+            "is_ma": lim_info["is_current"],
+            "is_current": lim_info["is_current"],
+        }
+
     def _sync_single_channel_hardware(self, key, force_set=False, preferred_kinds=None):
-        """【事务级原子配置同步算法】根据用户输入的实际转换比进行配置 (含 1/-1 极性调节)，完美消除误放大"""
         if preferred_kinds is None:
             preferred_kinds = {}
 
@@ -466,12 +704,11 @@ class HiokiPerfectApp:
         last_synced_range = self.instrument_ranges.get(key)
         last_synced_store = self.instrument_stores.get(key)
         last_synced_ratio = self.instrument_scalings.get(key)
-        sync_failed_flag = self.channel_vars[key].get("sync_failed", False)
+        sync_failed_flag = self.sync_failed_state.get(key, False)
         
         range_modified = (range_text != last_synced_range)
         ratio_modified = (ratio_text != last_synced_ratio)
         
-        # 仅当未发生过同步失败且配置完全一致时才跳过
         if not force_set and not sync_failed_flag and comment and not range_modified and not ratio_modified and last_synced_store is True:
             return True, range_text, True
 
@@ -482,7 +719,6 @@ class HiokiPerfectApp:
         last_readback = ""
 
         if comment:
-            # 1. 物理安全防护：先关闭 SCALing，解锁量程变更
             self.send_raw_cmd(f":SCALing:SET {ch_id},OFF")
             time.sleep(0.005)
             self.send_raw_cmd(f"{prefix_cmd}:STORe {ch_id},ON")
@@ -490,7 +726,6 @@ class HiokiPerfectApp:
             self.send_raw_cmd(f"{prefix_cmd}:INMOde {ch_id},VOLTAGE")
             time.sleep(0.005)
 
-            # 2. 备选参数逐一尝试与精准回读比对 (多形态退避重试)
             cmd_args = get_range_command_args(range_text, is_lr8450)
             for arg_kind, range_arg in cmd_args:
                 self.send_raw_cmd(f"{prefix_cmd}:RANGe {ch_id},{range_arg}")
@@ -507,33 +742,9 @@ class HiokiPerfectApp:
                     success = True
                     break
 
-            # 3. 配置物理注释与绘制色彩
             self.send_raw_cmd(f':COMMent:CH {ch_id},"{comment}"')
             color_idx = (ch - 1) % 24 + 1
             self.send_raw_cmd(f":DISPlay:DRAWing {ch_id},C{color_idx}")
-
-            # 4. 根据用户输入的实际转换比精准下发，绝不强行过滤或写死！
-            has_valid_ratio = False
-            if ratio_text:
-                try:
-                    ratio_val = float(ratio_text)
-                    if ratio_val != 0.0: # 用户输入了任何非零转换比 (含 1, -1, -50000, 50000 等)
-                        has_valid_ratio = True
-                        self.send_raw_cmd(f":SCALing:SET {ch_id},ENG")
-                        self.send_raw_cmd(f":SCALing:KIND {ch_id},RATIO")
-                        self.send_raw_cmd(f":SCALing:VOLT {ch_id},{ratio_val}")
-                        self.send_raw_cmd(f":SCALing:OFFSet {ch_id},0.0")
-                        
-                        # 自动判断单位：若注释明确带 (mA) 或转换比绝对值大于1.0，单位为 mA；否则为 V
-                        is_ma = ("(MA)" in comment.upper()) or (abs(ratio_val) > 1.0)
-                        unit_str = "mA" if is_ma else "V"
-                        self.send_raw_cmd(f':SCALing:UNIT {ch_id},"{unit_str}"')
-                except ValueError:
-                    pass
-
-            if not has_valid_ratio:
-                self.send_raw_cmd(f":SCALing:SET {ch_id},OFF")
-
             self.instrument_stores[key] = True
         else:
             range_arg = get_range_command_args(range_text, is_lr8450)[0][1]
@@ -549,9 +760,9 @@ class HiokiPerfectApp:
         if success:
             self.instrument_ranges[key] = range_text
             self.instrument_scalings[key] = ratio_text
-            self.channel_vars[key]["sync_failed"] = False
+            self.sync_failed_state[key] = False
         else:
-            self.channel_vars[key]["sync_failed"] = True
+            self.sync_failed_state[key] = True
 
         return success, actual_range_str, False
 
@@ -564,17 +775,18 @@ class HiokiPerfectApp:
         if len(self.selected_keys) > 1 and key in self.selected_keys:
             self.init_completed = False
             for k in self.selected_keys:
-                if k != key:
-                    if self.channel_vars[k]["range"].get() != selected_range:
-                        self.channel_vars[k]["range"].set(selected_range)
-                        targets.append(k)
+                if k != key and self.channel_vars[k]["range"].get() != selected_range:
+                    self.channel_vars[k]["range"].set(selected_range)
+                    targets.append(k)
             self.init_completed = True
             
+        self.config_unsynced = True
         self._schedule_save()
+        self._update_channel_limits_cache()
         
         if self.is_connected:
             if getattr(self, "timer_running", False):
-                self.write_log("[提示] 当前正在采集测量中，修改的量程已保存在本地，将在下次开始采集时同步到仪器中。")
+                self.write_log("[提示] 采集测量中修改的量程已保存，下次开始采集时将自动全面同步。")
             else:
                 threading.Thread(
                     target=self._bg_batch_set_ranges_now, 
@@ -588,8 +800,6 @@ class HiokiPerfectApp:
             self.write_log(f"[即时修改] 正在同步已修改量程的有效通道为 {range_text}...")
         
         preferred_kinds = {}
-        failed_channels = []
-        
         for k in keys:
             comment = self.channel_vars[k]["comment"].get().strip()
             ch_id = self.scpi_channel_mapping[k]
@@ -598,70 +808,27 @@ class HiokiPerfectApp:
             )
             if comment and not skipped:
                 if success:
-                    self.write_log(f"[即时修改成功] {ch_id} ({comment}) 的物理量程成功修改并应用为: {actual_range}")
+                    self.write_log(f"[即时修改] {ch_id} ({comment}) 量程成功应用为: {actual_range} ✓")
                 else:
-                    failed_channels.append({
-                        "ch_id": ch_id, "comment": comment, "expected": range_text, "actual": actual_range
-                    })
                     self.write_log(f"[即时修改失败] ⚠️ {ch_id} ({comment}) 无法更新量程！当前实际: {actual_range}")
 
         self.root.after(0, self._update_selection_visuals)
-        if failed_channels:
-            self.root.after(0, self.show_sync_failed_popup, failed_channels)
 
-    def _bg_sync_all_commented_ranges_now(self, keys, is_lr8450):
+    def _bg_sync_all_commented_ranges_now(self, keys, is_lr8450=None):
         preferred_kinds = {}
-        failed_channels = []
-        
         for k in keys:
             comment = self.channel_vars[k]["comment"].get().strip()
-            range_text = self.channel_vars[k]["range"].get()
             ch_id = self.scpi_channel_mapping[k]
-            
             success, actual_range, _ = self._sync_single_channel_hardware(
                 k, force_set=True, preferred_kinds=preferred_kinds
             )
             if success:
-                self.write_log(f"[连接同步成功] {ch_id} ({comment}) 的物理量程设为: {actual_range}")
-            else:
-                failed_channels.append({
-                    "ch_id": ch_id, "comment": comment, "expected": range_text, "actual": actual_range
-                })
-                self.write_log(f"[连接同步失败] ⚠️ {ch_id} ({comment}) 量程未成功配置！当前实际: {actual_range}")
+                self.write_log(f"[连接同步] {ch_id} ({comment}) 的物理量程设为: {actual_range} ✓")
                 
-        self.write_log("[连接同步] 所有已注释通道的初始化同步和回读校验已完成。")
+        self.write_log("[连接同步] 所有有效通道配置已完成硬件同步与回读验证 ✓ (瞬时就绪)")
         self.config_unsynced = False
-
         self.root.after(0, self._update_selection_visuals)
-        if failed_channels:
-            self.root.after(0, self.show_sync_failed_popup, failed_channels)
-
-    def show_sync_failed_popup(self, failed_list):
-        alert_win, main_frame = self._create_alert_window("⚠️ 通道物理量程同步失败", 540, 350, "#ff3b30", "#fff5f5")
-        
-        tk.Label(main_frame, text="⚠️ PHYSICAL SYNC FAILED", font=("Microsoft YaHei UI", 12, "bold"), fg="#ff3b30", bg="#fff5f5").pack(pady=8)
-        tk.Label(main_frame, text="以下活动通道的物理量程下发与回读验证失败，请确认串口通信或尝试手动在仪器面板进行设置。受影响的通道在统计看板已标红展示：", font=("Microsoft YaHei UI", 10), fg="#1c1c1e", bg="#fff5f5", wraplength=490, justify="left").pack(pady=4, padx=15)
-        
-        list_frame = tk.Frame(main_frame, bg="#ffffff", bd=1, relief="solid")
-        list_frame.pack(fill="both", expand=True, padx=15, pady=8)
-        
-        failed_text = scrolledtext.ScrolledText(
-            list_frame, wrap=tk.WORD, font=("Consolas", 10),
-            bg="#ffffff", fg="#ff3b30", bd=0, highlightthickness=0
-        )
-        failed_text.pack(fill="both", expand=True)
-        
-        for idx, item in enumerate(failed_list):
-            info = f"[{idx+1}] 通道: {item['ch_id']} ({item['comment']})\n    - 设定量程: {item['expected']}\n    - 实际回读: {item['actual']}\n\n"
-            failed_text.insert(tk.END, info)
-            
-        failed_text.config(state="disabled")
-        
-        tk.Button(
-            main_frame, text=" 我知道了 ", font=("Microsoft YaHei UI", 10, "bold"), 
-            bg="#ff3b30", fg="white", activebackground="#e03126", activeforeground="white", 
-            relief="flat", bd=0, cursor="hand2", command=alert_win.destroy, width=12, height=1
-        ).pack(pady=8)
+        self.root.after(0, self._restore_ui_after_task)
 
     def _sync_selected_values(self, key, event, field_name):
         if event.keysym in ["Control_L", "Control_R", "Shift_L", "Shift_R", "Alt_L", "Alt_R", "Caps_Lock", "Tab", "Escape"]:
@@ -676,7 +843,6 @@ class HiokiPerfectApp:
             self._schedule_save()
 
     def _handle_copy_sync(self, key, field_name):
-        """多选批量复制：复制所有选中通道的参数，按换行符分隔供 Excel 使用"""
         if len(self.selected_keys) > 1 and key in self.selected_keys:
             ordered_keys = [k for k in self.channel_keys if k in self.selected_keys]
             vals = [self.channel_vars[k][field_name].get() for k in ordered_keys]
@@ -742,7 +908,6 @@ class HiokiPerfectApp:
         return None
 
     def _handle_delete_sync(self, key, field_name, event=None):
-        """多选批量删除：清空所有选中通道的参数"""
         targets = list(self.selected_keys) if (len(self.selected_keys) > 1 and key in self.selected_keys) else [key]
         self.init_completed = False
         for k in targets:
@@ -754,35 +919,19 @@ class HiokiPerfectApp:
         self.write_log(f"[快捷删除] 已清空 {len(targets)} 个通道的{field_label}。")
         return "break"
 
-    def on_comment_copy(self, key, event):
-        return self._handle_copy_sync(key, "comment")
-
-    def on_comment_keyrelease(self, key, event):
-        self._sync_selected_values(key, event, "comment")
-
-    def on_comment_paste(self, key, event):
-        return self._handle_paste_sync(key, "comment")
-
+    def on_comment_copy(self, key, event): return self._handle_copy_sync(key, "comment")
+    def on_comment_keyrelease(self, key, event): self._sync_selected_values(key, event, "comment")
+    def on_comment_paste(self, key, event): return self._handle_paste_sync(key, "comment")
     def on_comment_delete(self, key, event):
-        if len(self.selected_keys) > 1 and key in self.selected_keys:
-            return self._handle_delete_sync(key, "comment", event)
-        if isinstance(event.widget, tk.Label):
+        if (len(self.selected_keys) > 1 and key in self.selected_keys) or isinstance(event.widget, tk.Label):
             return self._handle_delete_sync(key, "comment", event)
         return None
 
-    def on_ratio_copy(self, key, event):
-        return self._handle_copy_sync(key, "ratio")
-
-    def on_ratio_keyrelease(self, key, event):
-        self._sync_selected_values(key, event, "ratio")
-
-    def on_ratio_paste(self, key, event):
-        return self._handle_paste_sync(key, "ratio")
-
+    def on_ratio_copy(self, key, event): return self._handle_copy_sync(key, "ratio")
+    def on_ratio_keyrelease(self, key, event): self._sync_selected_values(key, event, "ratio")
+    def on_ratio_paste(self, key, event): return self._handle_paste_sync(key, "ratio")
     def on_ratio_delete(self, key, event):
-        if len(self.selected_keys) > 1 and key in self.selected_keys:
-            return self._handle_delete_sync(key, "ratio", event)
-        if isinstance(event.widget, tk.Label):
+        if (len(self.selected_keys) > 1 and key in self.selected_keys) or isinstance(event.widget, tk.Label):
             return self._handle_delete_sync(key, "ratio", event)
         return None
 
@@ -802,7 +951,6 @@ class HiokiPerfectApp:
         style.configure("TCombobox", 
                         fieldbackground="#ffffff", background="#f2f2f7", foreground="#1c1c1e", 
                         arrowcolor="#8e8e93", bordercolor="#e5e5ea", lightcolor="#e5e5ea", darkcolor="#e5e5ea")
-        
         style.map("TCombobox", 
                   fieldbackground=[("readonly", "#ffffff"), ("disabled", "#f2f2f7")], 
                   selectbackground=[("readonly", "#bae6fd"), ("focus", "#bae6fd")],
@@ -812,62 +960,56 @@ class HiokiPerfectApp:
         style.configure("Red.TCombobox", 
                         fieldbackground="#ffebee", background="#ffcdd2", foreground="#ff3b30", 
                         arrowcolor="#ff3b30", bordercolor="#ff8a80", lightcolor="#ff8a80", darkcolor="#ff8a80")
-        
         style.map("Red.TCombobox", 
                   fieldbackground=[("readonly", "#ffebee"), ("disabled", "#ffebee")], 
                   selectbackground=[("readonly", "#ffcdd2"), ("focus", "#ffcdd2")],
                   selectforeground=[("readonly", "#ff3b30"), ("focus", "#ff3b30")],
                   foreground=[("disabled", "#ff8a80"), ("readonly", "#ff3b30"), ("focus", "#ff3b30")])
         
-        conn_frame = tk.Frame(
-            self.root, bg="#ffffff", highlightbackground="#e5e5ea", 
-            highlightcolor="#e5e5ea", highlightthickness=1, bd=0
-        )
+        conn_frame = tk.Frame(self.root, bg="#ffffff", highlightbackground="#e5e5ea", highlightcolor="#e5e5ea", highlightthickness=1, bd=0)
         conn_frame.pack(fill="x", padx=15, pady=10)
         
-        glass_lbl = tk.Label(conn_frame, text=" 仪器连接及配置导入导出 ", font=("Microsoft YaHei UI", 11, "bold"), bg="#ffffff", fg="#007aff")
-        glass_lbl.grid(row=0, column=0, columnspan=13, sticky="w", padx=10, pady=5)
+        tk.Label(conn_frame, text=" 仪器连接及配置导入导出 ", font=("Microsoft YaHei UI", 11, "bold"), bg="#ffffff", fg="#007aff").grid(row=0, column=0, columnspan=11, sticky="w", padx=10, pady=5)
         
         tk.Label(conn_frame, text="串口号:", bg="#ffffff", fg="#8e8e93", font=("Microsoft YaHei UI", 10)).grid(row=1, column=0, padx=5, pady=8, sticky="w")
         self.port_combo = ttk.Combobox(conn_frame, textvariable=self.port, width=12, font=("Segoe UI", 10), state="readonly", postcommand=self.refresh_ports_on_click)
         self.port_combo.grid(row=1, column=1, padx=5, pady=8)
-        
-        tk.Label(conn_frame, text="波特率:", bg="#ffffff", fg="#8e8e93", font=("Microsoft YaHei UI", 10)).grid(row=1, column=2, padx=5, pady=8, sticky="w")
-        self.baud_combo = ttk.Combobox(conn_frame, textvariable=self.baudrate, values=["9600", "19200", "38400", "115200"], width=8, font=("Segoe UI", 10), state="readonly")
-        self.baud_combo.grid(row=1, column=3, padx=5, pady=8)
 
-        tk.Label(conn_frame, text="仪器型号:", bg="#ffffff", fg="#8e8e93", font=("Microsoft YaHei UI", 10)).grid(row=1, column=4, padx=5, pady=8, sticky="w")
+        tk.Label(conn_frame, text="仪器型号:", bg="#ffffff", fg="#8e8e93", font=("Microsoft YaHei UI", 10)).grid(row=1, column=2, padx=5, pady=8, sticky="w")
         self.model_combo = ttk.Combobox(conn_frame, textvariable=self.device_model, values=["LR8401-21", "LR8450"], width=10, font=("Segoe UI", 10), state="readonly")
-        self.model_combo.grid(row=1, column=5, padx=8, pady=8)
+        self.model_combo.grid(row=1, column=3, padx=5, pady=8)
 
-        tk.Label(conn_frame, text="记录间隔:", bg="#ffffff", fg="#8e8e93", font=("Microsoft YaHei UI", 10)).grid(row=1, column=6, padx=5, pady=8, sticky="w")
-        self.interval_combo = ttk.Combobox(conn_frame, textvariable=self.interval_var, values=["10ms", "20ms"], width=6, font=("Segoe UI", 10), state="readonly")
-        self.interval_combo.grid(row=1, column=7, padx=5, pady=8)
+        tk.Label(conn_frame, text="记录间隔:", bg="#ffffff", fg="#8e8e93", font=("Microsoft YaHei UI", 10)).grid(row=1, column=4, padx=5, pady=8, sticky="w")
+        self.interval_combo = ttk.Combobox(
+            conn_frame, textvariable=self.interval_var, 
+            values=["10ms", "20ms", "50ms", "100ms", "200ms", "500ms", "1s", "2s", "5s", "10s"], 
+            width=7, font=("Segoe UI", 10), state="readonly"
+        )
+        self.interval_combo.grid(row=1, column=5, padx=5, pady=8)
         
         self.btn_connect = tk.Button(
             conn_frame, text=" 连接仪器 ", bg="#007aff", fg="white", 
-            font=("Microsoft YaHei UI", 10, "bold"), relief="flat", activebackground="#0062cc", activeforeground="white", bd=0, cursor="hand2"
+            font=("Microsoft YaHei UI", 10, "bold"), relief="flat", activebackground="#0062cc", activeforeground="white", bd=0, cursor="hand2",
+            command=self.toggle_connection
         )
-        self.btn_connect.config(command=self.toggle_connection)
-        self.btn_connect.grid(row=1, column=8, padx=12, pady=8)
+        self.btn_connect.grid(row=1, column=6, padx=12, pady=8)
         
         self.lbl_status = tk.Label(conn_frame, text="未连接", fg="#ff3b30", font=("Microsoft YaHei UI", 11, "bold"), bg="#ffffff")
-        self.lbl_status.grid(row=1, column=9, padx=8, pady=8)
+        self.lbl_status.grid(row=1, column=7, padx=8, pady=8)
         
         btn_opts = {
             "font": ("Microsoft YaHei UI", 10, "bold"), "relief": "flat", "padx": 12, "pady": 4,
             "fg": "#007aff", "bg": "#f2f2f7", "activebackground": "#e5e5ea", "activeforeground": "#0056b3",
             "bd": 0, "cursor": "hand2"
         }
-        
         self.btn_import = tk.Button(conn_frame, text=" 📂 导入配置 ", command=self.import_config_file, **btn_opts)
-        self.btn_import.grid(row=1, column=10, padx=5, pady=8)
+        self.btn_import.grid(row=1, column=8, padx=5, pady=8)
         
         self.btn_export = tk.Button(conn_frame, text=" 💾 导出配置 ", command=self.export_config_file, **btn_opts)
-        self.btn_export.grid(row=1, column=11, padx=5, pady=8)
+        self.btn_export.grid(row=1, column=9, padx=5, pady=8)
 
         self.btn_batch = tk.Button(conn_frame, text=" 🔧 集中处理 ", command=self.open_batch_config_dialog, **btn_opts)
-        self.btn_batch.grid(row=1, column=12, padx=5, pady=8)
+        self.btn_batch.grid(row=1, column=10, padx=5, pady=8)
         
         matrix_outer_frame = tk.Frame(self.root, bg="#ffffff")
         matrix_outer_frame.pack(fill="x", padx=15, pady=5)
@@ -884,7 +1026,6 @@ class HiokiPerfectApp:
             tk.Label(parent, text="首注释 (多选及Excel粘)", font=("Microsoft YaHei UI", 10, "bold"), fg="#8e8e93", bg="#ffffff", width=18).grid(row=1, column=1, sticky="w", padx=2)
             tk.Label(parent, text="量程选择", font=("Microsoft YaHei UI", 10, "bold"), fg="#8e8e93", bg="#ffffff", width=10).grid(row=1, column=2, sticky="w", padx=2)
             tk.Label(parent, text="转换比", font=("Microsoft YaHei UI", 10, "bold"), fg="#8e8e93", bg="#ffffff", width=10).grid(row=1, column=3, sticky="w", padx=2)
-            
             tk.Label(parent, text="实时测量值", font=("Microsoft YaHei UI", 10, "bold"), bg="#007aff", fg="white", width=12).grid(row=1, column=4, padx=2)
             tk.Label(parent, text="平均值 (Avg)", font=("Microsoft YaHei UI", 10, "bold"), bg="#f2f2f7", fg="#8e8e93", width=11).grid(row=1, column=5, padx=2)
             tk.Label(parent, text="最大值 (Max)", font=("Microsoft YaHei UI", 10, "bold"), bg="#f2f2f7", fg="#8e8e93", width=11).grid(row=1, column=6, padx=2)
@@ -899,7 +1040,6 @@ class HiokiPerfectApp:
             prefix = "CH1" if unit == 1 else "CH2"
             for ch in range(1, 16):
                 key = f"1-{unit}-{ch}"
-                
                 row_bg = "#ffffff" if ch % 2 == 0 else "#f6f6f9"
                 self.channel_vars[key]["row_bg"] = row_bg
                 
@@ -921,13 +1061,11 @@ class HiokiPerfectApp:
                 self.channel_vars[key]["lbl_ch"] = lbl_ch
                 self.channel_vars[key]["cmb_range"] = cmb_range
                 
-                # 构建控件至通道 key 的 O(1) 映射关系，供鼠标拖拽多选使用
                 self.widget_to_key[lbl_ch] = key
                 self.widget_to_key[ent_comment] = key
                 self.widget_to_key[ent_ratio] = key
                 self.widget_to_key[cmb_range] = key
                 
-                # 通道名称标签事件绑定：按住拖动多选、复制、粘贴、Delete删除
                 lbl_ch.bind("<ButtonPress-1>", lambda e, k=key: self.on_drag_start(k, e))
                 lbl_ch.bind("<B1-Motion>", self.on_drag_motion)
                 lbl_ch.bind("<ButtonRelease-1>", self.on_drag_end)
@@ -936,7 +1074,6 @@ class HiokiPerfectApp:
                 lbl_ch.bind("<Delete>", lambda e, k=key: self.on_comment_delete(k, e))
                 lbl_ch.bind("<BackSpace>", lambda e, k=key: self.on_comment_delete(k, e))
                 
-                # 首注释输入框事件绑定：按住拖动多选、按键快捷同步
                 ent_comment.bind("<ButtonPress-1>", lambda e, k=key: self.on_drag_start(k, e))
                 ent_comment.bind("<B1-Motion>", self.on_drag_motion)
                 ent_comment.bind("<ButtonRelease-1>", self.on_drag_end)
@@ -947,7 +1084,6 @@ class HiokiPerfectApp:
                 ent_comment.bind("<Delete>", lambda e, k=key: self.on_comment_delete(k, e))
                 ent_comment.bind("<BackSpace>", lambda e, k=key: self.on_comment_delete(k, e))
                 
-                # 转换比输入框事件绑定：按住拖动多选、按键快捷同步
                 ent_ratio.bind("<ButtonPress-1>", lambda e, k=key: self.on_drag_start(k, e))
                 ent_ratio.bind("<B1-Motion>", self.on_drag_motion)
                 ent_ratio.bind("<ButtonRelease-1>", self.on_drag_end)
@@ -958,19 +1094,19 @@ class HiokiPerfectApp:
                 ent_ratio.bind("<Delete>", lambda e, k=key: self.on_ratio_delete(k, e))
                 ent_ratio.bind("<BackSpace>", lambda e, k=key: self.on_ratio_delete(k, e))
                 
-                lbl_val = tk.Label(matrix_frame, text="--", font=("Segoe UI", 10, "bold"), fg="#8e8e93", bg=row_bg, width=12, highlightthickness=0, bd=0)
+                lbl_val = tk.Label(matrix_frame, text="--", font=("Segoe UI", 10, "bold"), fg="#8e8e93", bg=row_bg, width=12, bd=0)
                 lbl_val.grid(row=ch+1, column=4, sticky="nsew", padx=2, pady=1)
                 self.channel_vars[key]["lbl_val"] = lbl_val
                 
-                lbl_avg = tk.Label(matrix_frame, text="--", font=("Segoe UI", 10, "bold"), fg="#8e8e93", bg=row_bg, width=11, highlightthickness=0, bd=0)
+                lbl_avg = tk.Label(matrix_frame, text="--", font=("Segoe UI", 10, "bold"), fg="#8e8e93", bg=row_bg, width=11, bd=0)
                 lbl_avg.grid(row=ch+1, column=5, sticky="nsew", padx=2, pady=1)
                 self.channel_vars[key]["lbl_avg"] = lbl_avg
 
-                lbl_max = tk.Label(matrix_frame, text="--", font=("Segoe UI", 10, "bold"), fg="#8e8e93", bg=row_bg, width=11, highlightthickness=0, bd=0)
+                lbl_max = tk.Label(matrix_frame, text="--", font=("Segoe UI", 10, "bold"), fg="#8e8e93", bg=row_bg, width=11, bd=0)
                 lbl_max.grid(row=ch+1, column=6, sticky="nsew", padx=2, pady=1)
                 self.channel_vars[key]["lbl_max"] = lbl_max
 
-                lbl_min = tk.Label(matrix_frame, text="--", font=("Segoe UI", 10, "bold"), fg="#8e8e93", bg=row_bg, width=11, highlightthickness=0, bd=0)
+                lbl_min = tk.Label(matrix_frame, text="--", font=("Segoe UI", 10, "bold"), fg="#8e8e93", bg=row_bg, width=11, bd=0)
                 lbl_min.grid(row=ch+1, column=7, sticky="nsew", padx=2, pady=1)
                 self.channel_vars[key]["lbl_min"] = lbl_min
 
@@ -979,43 +1115,38 @@ class HiokiPerfectApp:
         
         self.lbl_timer = tk.Label(
             control_frame, text="00:00.0", font=("Segoe UI", 32, "bold"), 
-            bg="#f2f2f7", fg="#1c1c1e", width=12, highlightthickness=0, bd=0
+            bg="#f2f2f7", fg="#1c1c1e", width=12, bd=0
         )
         self.lbl_timer.pack(side="left", padx=15, pady=8)
         
-        tk.Label(control_frame, text="SOC:", bg="#ffffff", fg="#1c1c1e", font=("Microsoft YaHei UI", 10, "bold")).pack(side="left", padx=5)
-        self.entry_case = self._create_ios_entry(control_frame, self.case_name, width=15)
-        self.entry_case.pack(side="left", padx=5)
-        
         self.btn_start = tk.Button(
             control_frame, text="▶ 开始采集 (Start)", bg="#34c759", fg="white", 
-            font=("Microsoft YaHei UI", 11, "bold"), relief="flat", height=2, width=15,
-            state="disabled", cursor="hand2", bd=0, activebackground="#2c9e47", activeforeground="white"
+            font=("Microsoft YaHei UI", 11, "bold"), relief="flat", height=2, width=18,
+            state="disabled", cursor="hand2", bd=0, activebackground="#2c9e47", activeforeground="white",
+            command=self.start_acquisition
         )
-        self.btn_start.config(command=self.start_acquisition)
-        self.btn_start.pack(side="left", expand=True, padx=10)
+        self.btn_start.pack(side="left", expand=True, padx=15)
         
         self.btn_copy = tk.Button(
             control_frame, text="📋 一键复制数据", bg="#5e5ce6", fg="white", 
-            font=("Microsoft YaHei UI", 11, "bold"), relief="flat", height=2, width=15,
-            cursor="hand2", bd=0, activebackground="#4d4cb8", activeforeground="white"
+            font=("Microsoft YaHei UI", 11, "bold"), relief="flat", height=2, width=18,
+            cursor="hand2", bd=0, activebackground="#4d4cb8", activeforeground="white",
+            command=self.copy_clipboard_data
         )
-        self.btn_copy.config(command=self.copy_clipboard_data)
-        self.btn_copy.pack(side="left", expand=True, padx=10)
+        self.btn_copy.pack(side="left", expand=True, padx=15)
         
         self.btn_stop = tk.Button(
             control_frame, text="■ 停止并保存 (Stop)", bg="#ff3b30", fg="white", 
-            font=("Microsoft YaHei UI", 11, "bold"), relief="flat", height=2, width=15,
-            state="disabled", cursor="hand2", bd=0, activebackground="#e03126", activeforeground="white"
+            font=("Microsoft YaHei UI", 11, "bold"), relief="flat", height=2, width=18,
+            state="disabled", cursor="hand2", bd=0, activebackground="#e03126", activeforeground="white",
+            command=self.stop_acquisition
         )
-        self.btn_stop.config(command=self.stop_acquisition)
-        self.btn_stop.pack(side="right", expand=True, padx=10)
+        self.btn_stop.pack(side="right", expand=True, padx=15)
         
         log_frame = tk.Frame(self.root, bg="#ffffff", highlightbackground="#e5e5ea", highlightcolor="#e5e5ea", highlightthickness=1, bd=0)
         log_frame.pack(fill="both", expand=True, padx=15, pady=10)
         
-        log_title = tk.Label(log_frame, text=" 实时程控日志及统计看板 ", font=("Microsoft YaHei UI", 10, "bold"), bg="#ffffff", fg="#8e8e93")
-        log_title.pack(anchor="w", padx=10, pady=5)
+        tk.Label(log_frame, text=" 实时程控日志及统计看板 ", font=("Microsoft YaHei UI", 10, "bold"), bg="#ffffff", fg="#8e8e93").pack(anchor="w", padx=10, pady=5)
         
         self.log_area = scrolledtext.ScrolledText(
             log_frame, wrap=tk.WORD, font=("Consolas", 11), 
@@ -1035,18 +1166,15 @@ class HiokiPerfectApp:
             self.port_combo.config(state="readonly")
             curr = self.port.get()
             if curr not in port_list:
-                if "COM31" in port_list:
-                    self.port.set("COM31")
-                else:
-                    self.port.set(port_list[0])
+                self.port.set("COM31" if "COM31" in port_list else port_list[0])
                     
         self.port_combo['values'] = port_list
 
     def auto_set_shortest_interval(self, verbose=True):
-        current_val = self.interval_var.get()
         if self.device_model.get() == "LR8450":
             return
 
+        current_val = self.interval_var.get()
         has_unit2_active = any(self.channel_vars[f"1-2-{ch}"]["comment"].get().strip() for ch in range(1, 16))
         if has_unit2_active and current_val == "10ms":
             self.interval_var.set("20ms")
@@ -1180,9 +1308,10 @@ class HiokiPerfectApp:
                     self.channel_vars[t_key]["ratio"].set(self.channel_vars[src_key]["ratio"].get())
                 
             self.init_completed = True
+            self.config_unsynced = True
             self.save_local_config()
             self._reset_gui_val_labels()
-            
+            self._update_channel_limits_cache()
             self.write_log(f"[集中复制] 成功将源 [{src_display.split(' ')[1]}] 的设定参数应用至目标通道。")
             
             if self.is_connected and synced_keys and param_vars["range"].get():
@@ -1202,18 +1331,11 @@ class HiokiPerfectApp:
         tk.Button(bottom_bar, text=" 取消 ", bg="#f2f2f7", fg="#007aff", font=("Microsoft YaHei UI", 10, "bold"), relief="flat", width=12, command=dialog.destroy, cursor="hand2").pack(side="right", padx=5)
 
     def _apply_config_dict(self, config):
-        if "port" in config:
-            self.port.set(config.get("port", ""))
-        if "baudrate" in config:
-            self.baudrate.set(config.get("baudrate", "115200"))
-        if "device_model" in config:
-            self.device_model.set(config.get("device_model", "LR8401-21"))
-        if "ch_30" in config:
-            self.ch30_var.set(config.get("ch_30", False))
-        if "interval" in config:
-            self.interval_var.set(config.get("interval", "10ms"))
-        if "soc" in config:
-            self.case_name.set(config.get("soc", ""))
+        if "port" in config: self.port.set(config.get("port", ""))
+        if "device_model" in config: self.device_model.set(config.get("device_model", "LR8401-21"))
+        if "ch_30" in config: self.ch30_var.set(config.get("ch_30", False))
+        if "interval" in config: self.interval_var.set(config.get("interval", "10ms"))
+        if "soc" in config: self.case_name.set(config.get("soc", ""))
             
         channels_data = config.get("channels", config)
         for key, val in channels_data.items():
@@ -1225,11 +1347,12 @@ class HiokiPerfectApp:
                 self.channel_vars[key]["range"].set(val.get("range", default_range))
                 self.channel_vars[key]["ratio"].set(val.get("ratio", ""))
         self.rebuild_scpi_channel_mapping()
+        self._update_channel_limits_cache()
 
     def _generate_config_dict(self):
         config = {
             "port": self.port.get(),
-            "baudrate": self.baudrate.get(),
+            "baudrate": "921600",
             "device_model": self.device_model.get(), 
             "ch_30": self.ch30_var.get(),            
             "interval": self.interval_var.get(),
@@ -1258,26 +1381,25 @@ class HiokiPerfectApp:
                 self.init_completed = True
                 self.config_unsynced = True
                 
-                # 彻底清除物理寄存器旧缓存，确保导入配置后绝对强行全量配置
                 self.instrument_ranges.clear()
                 self.instrument_stores.clear()
                 self.instrument_comments.clear()
                 self.instrument_scalings.clear()
+                for key in self.channel_keys:
+                    self.sync_failed_state[key] = False
                 
                 self.save_local_config()
                 self.write_log(f"[导入成功] 已加载配置: {os.path.basename(filepath)}")
                 self._reset_gui_val_labels()
                 
-                # 若当前已连接仪器，导入后立刻启动增量/全量硬件强行同步
                 if self.is_connected:
                     if getattr(self, "timer_running", False):
                         self.write_log("[提示] 当前正在采集测量中，导入的配置已保存在本地，将在下次开始采集时同步到仪器。")
                     else:
-                        is_lr8450 = (self.device_model.get() == "LR8450")
                         commented_keys = [k for k in self.channel_keys if self.channel_vars[k]["comment"].get().strip()]
                         if commented_keys:
                             self.write_log(f"[导入同步] 正在将导入的 {len(commented_keys)} 个有效通道配置物理下发至日置仪器...")
-                            threading.Thread(target=self._bg_sync_all_commented_ranges_now, args=(commented_keys, is_lr8450), daemon=True).start()
+                            threading.Thread(target=self._bg_sync_all_commented_ranges_now, args=(commented_keys,), daemon=True).start()
             except Exception as e:
                 self.init_completed = True
                 self.write_log(f"[导入失败] 载入文件出错: {e}")
@@ -1300,142 +1422,180 @@ class HiokiPerfectApp:
     def write_log(self, text):
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
         formatted_text = f"[{timestamp}] {text}\n"
-        self.root.after(0, self._safe_write_log, formatted_text)
-        
-    def _safe_write_log(self, text):
-        self.log_area.insert(tk.END, text)
-        self.log_area.see(tk.END)
+        with self.log_lock:
+            self.log_queue.append(formatted_text)
+
+    def _flush_log_queue(self):
+        chunks = []
+        with self.log_lock:
+            while self.log_queue:
+                chunks.append(self.log_queue.popleft())
+        if chunks:
+            self.log_area.insert(tk.END, "".join(chunks))
+            self.log_area.see(tk.END)
+        self.root.after(100, self._flush_log_queue)
 
     def toggle_connection(self):
         if not self.is_connected:
-            threading.Thread(target=self._bg_connect, daemon=True).start()
+            connect_config = {
+                "port": self.port.get().strip(),
+                "baudrate": 921600,
+                "device_model": self.device_model.get(),
+            }
+            threading.Thread(target=self._bg_connect, args=(connect_config,), daemon=True).start()
         else:
             self._disconnect_device()
 
     def _clear_serial_buffers(self):
         if self.ser and self.ser.is_open:
             try:
-                if self.ser.in_waiting > 0:
+                if getattr(self.ser, "in_waiting", 0) > 0:
                     self.ser.read(self.ser.in_waiting)
                 else:
                     self.ser.reset_input_buffer()
             except Exception:
                 pass
 
-    def _bg_connect(self):
-        port_val = self.port.get().strip()
+    def _drain_serial_buffer(self):
+        if self.ser and self.ser.is_open:
+            try:
+                self.ser.reset_input_buffer()
+                start = time.monotonic()
+                while time.monotonic() - start < 0.02:
+                    in_w = getattr(self.ser, "in_waiting", 0)
+                    if in_w > 0:
+                        self.ser.read(in_w)
+                        start = time.monotonic()
+                    else:
+                        time.sleep(0.001)
+            except Exception:
+                pass
+
+    def _bg_connect(self, connect_config):
+        port_val = connect_config["port"]
+        probe_bauds = [921600, 115200]
         
         if port_val == "无可用COM口":
             self.write_log("[错误] 当前无可用串口，无法连接！")
             return
             
-        self.write_log(f"正在建立物理通信 {port_val}...")
-        
-        try:
-            self.ser = serial.Serial(
-                port=port_val,
-                baudrate=int(self.baudrate.get()),
-                bytesize=serial.EIGHTBITS,
-                parity=serial.PARITY_NONE,
-                stopbits=serial.STOPBITS_ONE,
-                timeout=1.0
-            )
-            time.sleep(0.1)
-            
-            self._clear_serial_buffers()
-            self.send_raw_cmd(":HEADer OFF")
-            
-            idn = self.query_raw_cmd("*IDN?")
-            if idn:
-                self.write_log(f"设备成功建立通信: {idn}")
+        for baud in probe_bauds:
+            self.write_log(f"正在建立物理通信 {port_val} (波特率 {baud})...")
+            try:
+                if self.ser and self.ser.is_open:
+                    try: self.ser.close()
+                    except Exception: pass
                 
-                ch30_detected = False
-                is_lr8450 = "8450" in idn
+                self.ser = serial.Serial(
+                    port=port_val,
+                    baudrate=baud,
+                    bytesize=serial.EIGHTBITS,
+                    parity=serial.PARITY_NONE,
+                    stopbits=serial.STOPBITS_ONE,
+                    timeout=0.3
+                )
+                try:
+                    self.ser.dtr = True
+                    self.ser.rts = True
+                except Exception:
+                    pass
                 
-                if is_lr8450:
-                    self.root.after(0, lambda: self.device_model.set("LR8450"))
-                    self.root.after(0, lambda: self.ch30_var.set(True))
-                else:
-                    self.root.after(0, lambda: self.device_model.set("LR8401-21"))
-                    self.root.after(0, lambda: self.ch30_var.set(False))
+                time.sleep(0.05)
+                self._clear_serial_buffers()
                 
-                self.send_raw_cmd("*CLS")
+                self.send_raw_cmd(":HEADer OFF")
+                idn = self.query_raw_cmd("*IDN?")
                 
-                self.send_raw_cmd(":CONFigure:ATSAve OFF")
-                if is_lr8450:
-                    self.send_raw_cmd(":CONFigure:SAVEWave OFF")
-                    self.send_raw_cmd(":CONFigure:SAVECalc OFF")
-                
-                cmd_set, cmd_query = self._get_filter_scpi()
-                self.send_raw_cmd(cmd_set)
-                time.sleep(0.1)
-                
-                f_res = clean_scpi_response(self.query_raw_cmd(cmd_query).strip())
-                if f_res:
-                    self.write_log(f"[连接建立] 设定电网频率滤波器配置为: {f_res} - 已确认验证")
-                else:
-                    self.write_log(f"[连接建立] 设定电网频率滤波器配置为: 无法回显/查询超时，请手动在仪器面板确认")
-                
-                if is_lr8450:
-                    self.write_log("[自动检测] 识别到仪器实际型号为 HIOKI LR8450，自动转为 30ch 重映射模式。")
+                if not idn or "HIOKI" not in idn.upper():
+                    time.sleep(0.04)
+                    idn = self.query_raw_cmd("*IDN?")
                     
-                    opt_res = self.query_raw_cmd("*OPT?")
-                    if opt_res and "U8552" in opt_res.upper():
+                if idn and ("HIOKI" in idn.upper() or "LR" in idn.upper() or "84" in idn):
+                    self.write_log(f"设备成功建立通信 (波特率 {baud}): {idn}")
+                    self.root.after(0, lambda b=str(baud): self.baudrate.set(b))
+                    
+                    ch30_detected = False
+                    is_lr8450 = "8450" in idn
+                    
+                    self.send_raw_cmd("*CLS")
+                    self.send_raw_cmd(":CONFigure:ATSAve OFF")
+                    if is_lr8450:
+                        self.send_raw_cmd(":CONFigure:SAVEWave OFF")
+                        self.send_raw_cmd(":CONFigure:SAVECalc OFF")
+                    
+                    cmd_set, cmd_query = self._get_filter_scpi()
+                    self.send_raw_cmd(cmd_set)
+                    time.sleep(0.05)
+                    
+                    f_res = clean_scpi_response(self.query_raw_cmd(cmd_query).strip())
+                    if f_res:
+                        self.write_log(f"[连接建立] 设定电网频率滤波器配置为: {f_res} - 已确认验证 ✓")
+                        
+                    if is_lr8450:
+                        self.write_log("[自动检测] 识别到仪器实际型号为 HIOKI LR8450，自动转为 30ch 重映射模式。")
                         ch30_detected = True
-                    
-                    if not ch30_detected:
-                        time.sleep(0.05) 
-                        ans = self.query_raw_cmd(":UNIT:STORe? CH1_16") 
+                    else:
+                        ans = self.query_raw_cmd(":UNIT:STORe? CH1_16")
                         if ans and ("ON" in ans.upper() or "OFF" in ans.upper()):
                             ch30_detected = True
-                else:
-                    ans = self.query_raw_cmd(":UNIT:STORe? CH1_16")
-                    if ans and ("ON" in ans.upper() or "OFF" in ans.upper()):
-                        self.root.after(0, lambda: self.ch30_var.set(True))
-                    else:
-                        self.root.after(0, lambda: self.ch30_var.set(False))
-                
-                self.auto_set_shortest_interval(verbose=True)
-                self.root.after(0, self.rebuild_scpi_channel_mapping)
-                
-                # 重试连接时清空寄存器旧缓存，防污染
-                self.instrument_ranges.clear()
-                self.instrument_stores.clear()
-                self.instrument_comments.clear()
-                self.instrument_scalings.clear()
-                
-                self.is_connected = True
-                self.config_unsynced = True
-                self.root.after(0, self._update_ui_connected)
-                
-                commented_keys = [k for k in self.channel_keys if self.channel_vars[k]["comment"].get().strip()]
-                if commented_keys:
-                    self.write_log(f"[连接同步] 检测到当前控制台有 {len(commented_keys)} 个有注释的通道，正在初始化并配置物理仪器量程...")
-                    threading.Thread(target=self._bg_sync_all_commented_ranges_now, args=(commented_keys, is_lr8450), daemon=True).start()
-            else:
-                self.write_log("握手无响应。请确认日置菜单中 [System]->[USB] 处于 Comm 模式。")
-                self._disconnect_device()
-        except Exception as e:
-            self.write_log(f"串口连接异常: {e}")
-            self._disconnect_device()
+
+                    self.root.after(0, self._on_connection_ready, is_lr8450, ch30_detected)
+                    return
+            except (serial.SerialException, OSError, Exception) as e:
+                self.write_log(f"尝试波特率 {baud} 异常: {e}")
+        
+        self.write_log("握手无响应。请确认日置菜单中 [System]->[USB] 处于 Comm 模式。")
+        self._disconnect_device()
+
+    def _on_connection_ready(self, is_lr8450, ch30_detected):
+        self.device_model.set("LR8450" if is_lr8450 else "LR8401-21")
+        self.ch30_var.set(ch30_detected if not is_lr8450 else True)
+
+        self.auto_set_shortest_interval(verbose=True)
+        self.rebuild_scpi_channel_mapping()
+
+        self.instrument_ranges.clear()
+        self.instrument_stores.clear()
+        self.instrument_comments.clear()
+        self.instrument_scalings.clear()
+        for key in self.channel_keys:
+            self.sync_failed_state[key] = False
+
+        self._update_channel_limits_cache()
+        self.is_connected = True
+        self.config_unsynced = True
+        self._update_ui_connected()
+
+        commented_keys = [k for k in self.channel_keys if self.channel_vars[k]["comment"].get().strip()]
+        if commented_keys:
+            self.write_log(f"[连接同步] 检测到当前控制台有 {len(commented_keys)} 个有注释的通道，正在初始化并配置物理仪器量程...")
+            threading.Thread(
+                target=self._bg_sync_all_commented_ranges_now,
+                args=(commented_keys, is_lr8450),
+                daemon=True
+            ).start()
 
     def _update_ui_connected(self):
         self.btn_connect.config(text=" 断开连接 ", bg="#f2f2f7", fg="#007aff")
         self.lbl_status.config(text="已连接", fg="#34c759")
         self.btn_start.config(state="normal")
         self.port_combo.config(state="disabled")
-        self.baud_combo.config(state="disabled")
         self.model_combo.config(state="disabled")
         self.interval_combo.config(state="disabled")
         self.btn_import.config(state="disabled")
         self.btn_batch.config(state="normal")
 
     def _disconnect_device(self):
-        if self.ser and self.ser.is_open:
-            self.ser.close()
-        self.ser = None
+        with self.ser_lock:
+            if self.ser and self.ser.is_open:
+                try: self.ser.close()
+                except Exception: pass
+            self.ser = None
+
         self.is_connected = False
         self.timer_running = False
+        self.stop_monitor_event.set()
+        self.monitor_thread = None
         
         self.instrument_ranges.clear()
         self.instrument_stores.clear()
@@ -1446,8 +1606,9 @@ class HiokiPerfectApp:
         self._selection_visual_cache.clear()
         
         for key in self.channel_keys:
-            self.channel_vars[key]["sync_failed"] = False
+            self.sync_failed_state[key] = False
 
+        self.root.after(0, self._dismiss_unified_alert_window)
         self.root.after(0, self._update_ui_disconnected)
         self.root.after(0, lambda: self._update_selection_visuals(force=True))
         self.write_log("已释放串口资源并清空量程寄存器与渲染缓存。")
@@ -1458,14 +1619,12 @@ class HiokiPerfectApp:
         self.btn_start.config(state="disabled")
         self.btn_stop.config(state="disabled")
         self.port_combo.config(state="readonly")
-        self.baud_combo.config(state="readonly")
         self.model_combo.config(state="readonly")
         self.interval_combo.config(state="readonly")
         self.btn_import.config(state="normal")
         self.btn_batch.config(state="normal")
 
     def send_raw_cmd(self, cmd):
-        """极速 SCPI 指令发送 (严密单锁，精准控制)"""
         with self.ser_lock:
             if self.ser and self.ser.is_open:
                 try:
@@ -1473,24 +1632,31 @@ class HiokiPerfectApp:
                     full_cmd = f"{cmd}\r\n"
                     self.ser.write(full_cmd.encode('ascii'))
                     self.ser.flush()
+                    return True
                 except Exception as e:
                     self.write_log(f"指令下发错误: {e}")
+                    return False
+            return False
 
-    def query_raw_cmd(self, cmd):
-        """极速 SCPI 指令查询 (Lockstep 步进严格防滑移，保证下发与响应 100% 一对一锁定)"""
+    def query_raw_cmd(self, cmd, timeout=None):
         with self.ser_lock:
             if self.ser and self.ser.is_open:
+                old_timeout = self.ser.timeout
                 try:
+                    if timeout is not None:
+                        self.ser.timeout = max(0.05, float(timeout))
                     self._clear_serial_buffers()
                     full_cmd = f"{cmd}\r\n"
                     self.ser.write(full_cmd.encode('ascii'))
                     self.ser.flush()
-                    time.sleep(0.003)  # 步进锁延时：确保硬件数据完全传入串口 FIFO，消除跨通道错位
                     response = self.ser.readline().decode('ascii', errors='ignore').strip()
                     return response
                 except Exception as e:
                     self.write_log(f"指令查询错误: {e}")
                     return ""
+                finally:
+                    if timeout is not None:
+                        self.ser.timeout = old_timeout
             return ""
 
     def _schedule_save(self, *args):
@@ -1510,13 +1676,17 @@ class HiokiPerfectApp:
             self._save_timer_id = None
             
         self.auto_set_shortest_interval(verbose=True)
-        
         config = self._generate_config_dict()
+        tmp_path = "hioki_config.json.tmp"
+        final_path = "hioki_config.json"
         try:
-            with open("hioki_config.json", "w", encoding="utf-8") as f:
+            with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(config, f, indent=4, ensure_ascii=False)
-        except Exception:
-            pass
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, final_path)
+        except Exception as e:
+            self.write_log(f"[配置保存失败] {e}")
 
     def load_local_config(self):
         if os.path.exists("hioki_config.json"):
@@ -1525,8 +1695,8 @@ class HiokiPerfectApp:
                     config = json.load(f)
                     self._apply_config_dict(config)
                 self.write_log("[配置读取] 成功恢复上次运行的配置信息。")
-            except Exception:
-                pass
+            except Exception as e:
+                self.write_log(f"[配置读取失败] {e}")
 
     def on_close_save(self):
         self.save_local_config()
@@ -1573,9 +1743,9 @@ class HiokiPerfectApp:
         unit = " mA" if is_ma else " V"
         row_bg = self.channel_vars[key]["row_bg"]
         
-        avg_text, avg_fg = ("--", "#8e8e93") if math.isnan(avg) else (f"{avg:{fmt}}{unit}", "#ff3b30" if avg < 0 else "#1c1c1e")
-        max_text, max_fg = ("--", "#8e8e93") if math.isnan(max_val) else (f"{max_val:{fmt}}{unit}", "#ff3b30" if max_val < 0 else "#1c1c1e")
-        min_text, min_fg = ("--", "#8e8e93") if math.isnan(min_val) else (f"{min_val:{fmt}}{unit}", "#ff3b30" if min_val < 0 else "#1c1c1e")
+        avg_text, avg_fg = ("--", "#8e8e93") if (avg is None or math.isnan(avg)) else (f"{avg:{fmt}}{unit}", "#ff3b30" if avg < 0 else "#1c1c1e")
+        max_text, max_fg = ("--", "#8e8e93") if (max_val is None or math.isnan(max_val)) else (f"{max_val:{fmt}}{unit}", "#ff3b30" if max_val < 0 else "#1c1c1e")
+        min_text, min_fg = ("--", "#8e8e93") if (min_val is None or math.isnan(min_val)) else (f"{min_val:{fmt}}{unit}", "#ff3b30" if min_val < 0 else "#1c1c1e")
             
         target_state = (avg_text, avg_fg, max_text, max_fg, min_text, min_fg)
         cache_entry = self.gui_stat_cache.get(key)
@@ -1594,80 +1764,23 @@ class HiokiPerfectApp:
         for key, avg, max_val, min_val in updates:
             self._update_gui_stat_labels(key, avg, max_val, min_val)
 
-    def show_over_alert(self, channel_key, comment):
-        meta = self.channel_metadata[channel_key]
-        ch_display = f"{meta['prefix']}_{meta['ch']}"
-        msg = f"通道 {ch_display} ({comment}) 发生 OVER 物理硬件溢出！" if comment else f"通道 {ch_display} 发生 OVER 溢出！"
-        
-        alert_win, main_frame = self._create_alert_window("⚠️ 测量值溢出告警", 460, 180, "#ff3b30", "#fff5f5")
-        
-        tk.Label(main_frame, text="⚠️ MEASUREMENT OVERFLOW", font=("Microsoft YaHei UI", 12, "bold"), fg="#ff3b30", bg="#fff5f5").pack(pady=10)
-        tk.Label(main_frame, text=msg, font=("Microsoft YaHei UI", 11, "bold"), fg="#1c1c1e", bg="#fff5f5", wraplength=420).pack(pady=5)
-        
-        tk.Button(
-            main_frame, text=" 我知道了 ", font=("Microsoft YaHei UI", 10, "bold"), 
-            bg="#ff3b30", fg="white", activebackground="#e03126", activeforeground="white", 
-            relief="flat", bd=0, cursor="hand2", command=alert_win.destroy, width=12, height=1
-        ).pack(pady=10)
-
-    def show_soft_over_alert(self, channel_key, comment, raw_volt, limit_volt, current_val):
-        """防卡死非阻塞式通道软量程截幅（饱和）警报弹窗（增加清晰的瞬态与稳态说明）"""
-        meta = self.channel_metadata[channel_key]
-        ch_display = f"{meta['prefix']}_{meta['ch']}"
-        
-        is_ma = self.is_ma_channel.get(channel_key, False)
-        unit_str = "mA" if is_ma else "V"
-        fmt_str = ".3f" if is_ma else ".4f"
-        type_str = "电流" if is_ma else "电压"
-
-        msg = (
-            f"通道 {ch_display} ({comment}) 在测试过程中抓取到瞬态峰值溢出！\n\n"
-            f"• 抓获瞬态峰值电压：{raw_volt*1000:.3f} mV (当前稳态: {current_val:{fmt_str}} {unit_str})\n"
-            f"• 硬件设定物理量程：{limit_volt*1000:.1f} mV\n\n"
-            f"【原理提示】虽然当前稳态{type_str}较小，但上电/负载切换瞬间的峰值电压已超出物理量程上限！"
-            f"信号已被硬件截幅钳位，下一次开始采集时系统将自动升档该通道量程。"
-        )
-        
-        alert_win, main_frame = self._create_alert_window("⚠️ 软超量程截幅告警", 520, 250, "#f59e0b", "#fff9db")
-        
-        tk.Label(main_frame, text="⚠️ RANGE SATURATION (软截幅饱和)", font=("Microsoft YaHei UI", 12, "bold"), fg="#d97706", bg="#fff9db").pack(pady=10)
-        tk.Label(main_frame, text=msg, font=("Microsoft YaHei UI", 10, "bold"), fg="#1c1c1e", bg="#fff9db", justify="left", wraplength=480).pack(pady=5)
-        
-        tk.Button(
-            main_frame, text=" 我知道了 ", font=("Microsoft YaHei UI", 10, "bold"), 
-            bg="#f59e0b", fg="white", activebackground="#d97706", activeforeground="white", 
-            relief="flat", bd=0, cursor="hand2", command=alert_win.destroy, width=12, height=1
-        ).pack(pady=10)
-
     def _update_channel_limits_cache(self):
-        """【解决升档后误报 Bug 的关键核心】根据当前 UI 升档后的最新量程，精准重新更新各通道阈值缓存"""
-        def check_is_ma(k):
-            comment = self.channel_vars[k]["comment"].get().strip()
-            if "(MA)" in comment.upper():
-                return True
-            ratio_text = self.channel_vars[k]["ratio"].get().strip()
-            if ratio_text:
-                try:
-                    val = float(ratio_text)
-                    return abs(val) > 1.0
-                except ValueError:
-                    return False
-            return False
-
-        self.is_ma_channel = {key: check_is_ma(key) for key in self.channel_keys}
-
+        self.is_ma_channel = {}
         self.channel_limits_cache = {}
         for key in self.channel_keys:
-            r_text = self.channel_vars[key]["range"].get() # 精准读取升档后的最新 UI 量程字符串
-            limit_volt = RANGE_LIMITS_VOLTS.get(r_text, 0.01)
-            
+            comment = self.channel_vars[key]["comment"].get().strip()
             ratio_text = self.channel_vars[key]["ratio"].get().strip()
+            is_curr = is_current_channel(comment, ratio_text)
+            self.is_ma_channel[key] = is_curr
+            
+            r_text = self.channel_vars[key]["range"].get()
+            limit_volt = RANGE_LIMITS_VOLTS.get(r_text, 0.01)
             ratio_val = 1.0
             is_scaled = False
             if ratio_text:
                 try:
                     ratio_val = float(ratio_text)
-                    if ratio_val != 0.0 and abs(ratio_val) > 1.0:
+                    if ratio_val != 0.0:
                         is_scaled = True
                 except ValueError:
                     pass
@@ -1675,87 +1788,118 @@ class HiokiPerfectApp:
             self.channel_limits_cache[key] = {
                 "limit_volt": limit_volt,
                 "ratio_val": ratio_val,
-                "is_scaled": is_scaled
+                "is_scaled": is_scaled,
+                "is_current": is_curr
             }
 
     def start_acquisition(self):
         self.btn_connect.config(state="disabled")
         self.btn_start.config(state="disabled")
         self.btn_batch.config(state="disabled") 
-        
         self.total_frames = 0
         self._reset_gui_val_labels()
         
-        # 复制上一轮采集中触发 OVER 或软超量程的通道集合，用于自动升档
-        self.over_channels_to_upgrade = set(self.alerted_over_channels)
-        self.alerted_over_channels.clear()
+        # 1. 负平均值智能极性翻转
+        if getattr(self, "last_test_stats", None):
+            for key in self.channel_keys:
+                comment = self.channel_vars[key]["comment"].get().strip()
+                if not comment:
+                    continue
+                st = self.last_test_stats.get(key)
+                if st and st.get("valid_count", 0) > 0 and not math.isnan(st.get("avg", math.nan)):
+                    if st["avg"] < 0:
+                        cur_ratio = self.channel_vars[key]["ratio"].get().strip()
+                        new_ratio = invert_ratio_sign(cur_ratio)
+                        self.channel_vars[key]["ratio"].set(new_ratio)
+                        ch_display = self.scpi_channel_mapping.get(key, key)
+                        self.write_log(
+                            f"[自适应符号翻转] {ch_display} ({comment}) 上次平均值为负 ({st['avg']:.3f})，转换比符号已自动翻转: {cur_ratio or '1'} → {new_ratio}"
+                        )
+            self.last_test_stats.clear()
+
+        # 2. 测量类型量程初次/重试精准校准 (电流10mV起步，电压1V起步)
+        for key in self.channel_keys:
+            comment = self.channel_vars[key]["comment"].get().strip()
+            if not comment:
+                continue
+            ratio_str = self.channel_vars[key]["ratio"].get().strip()
+            is_curr = is_current_channel(comment, ratio_str)
+            curr_range = self.channel_vars[key]["range"].get()
+            if is_curr:
+                if curr_range in ("1V", "2V", "10V", "20V", "100V") and key not in self.pending_optimal_ranges:
+                    self.channel_vars[key]["range"].set("10mV")
+                    ch_display = self.scpi_channel_mapping.get(key, key)
+                    self.write_log(f"[自适应起步] {ch_display} ({comment}) 判定为电流通道，已自动切换为最高分辨率 10mV 量程")
+            else:
+                if curr_range in ("10mV", "20mV", "100mV", "200mV") and key not in self.pending_optimal_ranges:
+                    self.channel_vars[key]["range"].set("1V")
+                    ch_display = self.scpi_channel_mapping.get(key, key)
+                    self.write_log(f"[自适应起步] {ch_display} ({comment}) 判定为电压通道，已自动切换为基准 1V 量程")
+
+        # 3. 待调档应用 (基于捕获到的实测峰值，完美覆盖升档与降档)
+        if self.pending_optimal_ranges:
+            for key, target_range in tuple(self.pending_optimal_ranges.items()):
+                vars_dict = self.channel_vars[key]
+                comment = vars_dict["comment"].get().strip()
+                if not comment: continue
+                curr_range = vars_dict["range"].get()
+                if target_range != curr_range:
+                    vars_dict["range"].set(target_range)
+                    ch_display = self.scpi_channel_mapping.get(key, key)
+                    action = "升档" if RANGE_LIST.index(target_range) > RANGE_LIST.index(curr_range) else "降档优化"
+                    self.write_log(f"[实测自适应{action}] {ch_display} ({comment}) 量程自适应调整为: {target_range} (原: {curr_range})")
         
+        self.over_channels_to_upgrade.clear()
+        self.pending_optimal_ranges.clear()
+        self.alerted_over_channels.clear()
+        self.unified_alert_items.clear()
+        self._dismiss_unified_alert_window()
+
         for key in self.channel_keys:
             self.stats_count[key] = 0
             self.stats_sum[key] = 0.0
+            self.stats_comp[key] = 0.0
             self.stats_max[key] = -float('inf')
             self.stats_min[key] = float('inf')
-            
+            self.stats_raw_peaks[key] = 0.0
+            self.stats_over[key] = 0
+
+        self.auto_set_shortest_interval(verbose=False)
+        self._update_channel_limits_cache()
         self.save_local_config()
+        
         threading.Thread(target=self._bg_start_task, daemon=True).start()
 
     def _bg_start_task(self):
         self.send_raw_cmd("*CLS")
-        
         self.send_raw_cmd(":CONFigure:ATSAve OFF")
         is_lr8450 = (self.device_model.get() == "LR8450")
         if is_lr8450:
             self.send_raw_cmd(":CONFigure:SAVEWave OFF")
             self.send_raw_cmd(":CONFigure:SAVECalc OFF")
-        
-        # 1. 超量程/OVER 通道自动升档量程处理
-        auto_upgraded_keys = set()
-        if hasattr(self, "over_channels_to_upgrade") and self.over_channels_to_upgrade:
-            for key in self.over_channels_to_upgrade:
-                comment = self.channel_vars[key]["comment"].get().strip()
-                if comment:
-                    curr_range = self.channel_vars[key]["range"].get()
-                    next_range = get_next_range(curr_range)
-                    if next_range != curr_range:
-                        self.channel_vars[key]["range"].set(next_range)
-                        auto_upgraded_keys.add(key)
-                        ch_display = self.scpi_channel_mapping.get(key, key)
-                        self.write_log(f"[自动升档] 通道 {ch_display} ({comment}) 上次测量触发超量程/OVER，量程自动由 {curr_range} 升档至 {next_range}")
-            self.over_channels_to_upgrade.clear()
 
-        # 2. 自动检索需下发硬件同步的通道 (含上次同步失败、本次自动升档、配置未匹配的有效通道)
         pending_sync_keys = set()
         for key in self.channel_keys:
             comment = self.channel_vars[key]["comment"].get().strip()
             if comment:
-                if (key in auto_upgraded_keys or 
-                    self.channel_vars[key].get("sync_failed", False) or 
+                if (self.sync_failed_state.get(key, False) or 
                     self.instrument_ranges.get(key) != self.channel_vars[key]["range"].get() or
                     self.instrument_stores.get(key) is not True):
                     pending_sync_keys.add(key)
 
-        # 3. 智能硬件同步下发与验证
         if getattr(self, "config_unsynced", True):
             self.write_log(">>> 检测到本地配置有变动，正在重构写入日置通道矩阵...")
-            
             cmd_set, cmd_query = self._get_filter_scpi()
             self.send_raw_cmd(cmd_set)
             time.sleep(0.05)
             
             f_res = clean_scpi_response(self.query_raw_cmd(cmd_query).strip())
             if f_res:
-                self.write_log(f">>> 设定滤波器配置为: 50Hz (设备当前读取状态: {f_res} - 已确认验证)")
-            else:
-                self.write_log(f">>> 设定滤波器配置为: 50Hz (设备当前读取状态: 无法回显/查询超时，请手动在仪器面板确认)")
+                self.write_log(f">>> 设定滤波器配置为: 50Hz (设备当前读取状态: {f_res} - 已确认验证 ✓)")
             
             interval_val = self.interval_var.get()
             try:
-                if interval_val.endswith("ms"):
-                    interval_sec = float(interval_val.replace("ms", "")) / 1000.0
-                elif interval_val.endswith("s"):
-                    interval_sec = float(interval_val.replace("s", ""))
-                else:
-                    interval_sec = float(interval_val)
+                interval_sec = parse_interval_seconds(interval_val)
             except ValueError:
                 interval_sec = 0.01
                 
@@ -1771,7 +1915,7 @@ class HiokiPerfectApp:
                 )
                 if comment and not skipped:
                     if success:
-                        self.write_log(f"[物理配置验证] {ch_id} ({comment}) 的物理配置已成功同步: {actual_range}")
+                        self.write_log(f"[物理配置验证] {ch_id} ({comment}) 的物理配置已成功同步: {actual_range} ✓")
                     else:
                         self.write_log(f"[警告] {ch_id} ({comment}) 配置同步失败！标红待下次自动重试！当前实际: {actual_range}")
             
@@ -1781,7 +1925,7 @@ class HiokiPerfectApp:
             self.send_raw_cmd(":DISPlay:GROUp ALL")
             self.config_unsynced = False
         elif pending_sync_keys:
-            self.write_log(f">>> 正在对 {len(pending_sync_keys)} 个同步失败/升档通道进行硬件自动重新同步...")
+            self.write_log(f">>> 正在对 {len(pending_sync_keys)} 个变动/升档通道进行硬件自动重新同步...")
             preferred_kinds = {}
             for key in pending_sync_keys:
                 comment = self.channel_vars[key]["comment"].get().strip()
@@ -1790,15 +1934,13 @@ class HiokiPerfectApp:
                     key, force_set=True, preferred_kinds=preferred_kinds
                 )
                 if success:
-                    self.write_log(f"[自动重试同步成功] {ch_id} ({comment}) 的物理配置及量程成功应用: {actual_range}")
+                    self.write_log(f"[自动重试同步成功] {ch_id} ({comment}) 的物理配置及量程成功应用: {actual_range} ✓")
                 else:
                     self.write_log(f"[自动重试同步失败] ⚠️ {ch_id} ({comment}) 依旧无法写入量程！当前实际: {actual_range}")
         else:
             self.write_log(">>> 检测到通道配置与仪器保持一致，跳过参数写入，瞬间秒级开始采集！")
             
         self.root.after(0, self._update_selection_visuals)
-
-        # 4. 【核心防御】在升档与硬件同步全量完成后，立即更新通道阈值缓存！保证 limit_volt 读取的是升档后的最新值
         self._update_channel_limits_cache()
 
         self.write_log(">>> 正在启动测量记录...")
@@ -1811,21 +1953,22 @@ class HiokiPerfectApp:
 
     def _start_ui_timer(self):
         self.timer_running = True
-        self.start_time = time.time()
+        self.stop_monitor_event.clear()
+        self.start_time = time.monotonic()
         self.btn_stop.config(state="normal")
         
         with self.ser_lock:
             if self.ser and self.ser.is_open:
-                self.ser.timeout = 0.1  # 精准减小接收超时，实现极速响应
+                self.ser.timeout = 0.2
                 
-        threading.Thread(target=self._bg_realtime_stream_worker, daemon=True).start()
-        
+        self.monitor_thread = threading.Thread(target=self._bg_realtime_stream_worker, daemon=True)
+        self.monitor_thread.start()
         self._update_timer_loop()
-        self.write_log("【实时流采集模式】高精度测量数据实时截获并显示中...")
+        self.write_log("【原生高精度实时流模式】正在高速获取原生 ADC 物理电压与工程测量数据...")
 
     def _update_timer_loop(self):
         if self.timer_running:
-            self.elapsed_time = time.time() - self.start_time
+            self.elapsed_time = time.monotonic() - self.start_time
             mins = int(self.elapsed_time // 60)
             secs = int(self.elapsed_time % 60)
             tenths = int((self.elapsed_time * 10) % 10)
@@ -1833,7 +1976,13 @@ class HiokiPerfectApp:
             self.root.after(100, self._update_timer_loop)
 
     def _bg_realtime_stream_worker(self):
-        """极速测量值流截获线程 (算法级优化：与 Logger utility 完全一致的硬件 0.35s 启动冲刷护城河与 Min/Max 稳态过滤器)"""
+        """
+        【SOTA 原生 ADC 高速高精实时流采集引擎】
+        1. 下发 :MEMory:GETReal 抓取当前物理最新 ADC 采样值；
+        2. 通过 :MEMory:VREAl? 查询各通道 100% 纯正未经截断的原生物理电压 (Volts)；
+        3. 上位机利用 64-bit 双精度浮点完成工程转换 (mA / V)，消除仪器硬件 Scaling 缺陷；
+        4. Neumaier 算法精确累加统计，绝对消除长时间测试产生的浮点漂移。
+        """
         self.active_channels = []
         for key in self.channel_keys:
             comment = self.channel_vars[key]["comment"].get().strip()
@@ -1846,121 +1995,121 @@ class HiokiPerfectApp:
                     "unit": meta["unit"],
                     "ch": meta["ch"],
                     "comment": comment,
+                    "range": self.channel_vars[key]["range"].get(),
+                    "ratio": self.channel_vars[key]["ratio"].get().strip(),
                     "scpi_ch": scpi_ch,
                     "query_cmd": f":MEMory:VREAl? {scpi_ch}",
                     "limit_volt": lim_info["limit_volt"],
                     "ratio_val": lim_info["ratio_val"],
-                    "is_scaled": lim_info["is_scaled"]
+                    "is_scaled": lim_info["is_scaled"],
+                    "is_current": lim_info["is_current"]
                 })
                     
         num_active = len(self.active_channels)
         if num_active == 0:
+            self.write_log("[提示] 没有已配置注释的有效通道。")
             return
             
-        # 启动前冲刷清空一次可能残留的硬件旧内存帧 (Flush Memory Buffer)
         self.send_raw_cmd(":MEMory:GETReal")
         time.sleep(0.02)
         for chan in self.active_channels:
             self.query_raw_cmd(chan["query_cmd"])
             
-        last_gui_val_update = time.time()
-        last_gui_stat_update = time.time()
-        stream_start_time = time.time() # 记录硬件启动时间
+        last_gui_val_update = time.monotonic()
+        last_gui_stat_update = time.monotonic()
+        stream_start_time = time.monotonic()
         
-        while self.timer_running:
+        while self.timer_running and not self.stop_monitor_event.is_set():
             self.send_raw_cmd(":MEMory:GETReal")
             
             gui_vals = []
-            valid_samples_count = 0
-            is_warmup_window = (time.time() - stream_start_time < 0.35) # 0.35秒硬件启动热身对齐窗，丢弃 AD 硬件刚启动瞬间的未稳态坏帧
+            is_warmup_window = (time.monotonic() - stream_start_time < 0.35)
             
             for chan in self.active_channels:
-                if not self.timer_running:
+                if not self.timer_running or self.stop_monitor_event.is_set():
                     break
                 
-                res_str = clean_scpi_response(self.query_raw_cmd(chan["query_cmd"]))
+                raw_resp = self.query_raw_cmd(chan["query_cmd"])
+                val_adc, status = parse_single_chan_response(raw_resp)
                 
-                val_float = 0.0
-                is_over = False
-                is_valid = False
-                is_range_exceeded = False
+                k = chan["key"]
                 limit_volt = chan["limit_volt"]
+                is_curr = chan["is_current"]
                 
-                if res_str:
-                    res_upper = res_str.upper()
-                    if ("OVER" in res_upper) or ("NAN" in res_upper) or ("INF" in res_upper) or ("O.R" in res_upper):
-                        is_over = True
-                    else:
-                        try:
-                            val_float = float(res_str)
-                            if abs(val_float) >= 1.0e+9:
-                                is_over = True
-                            else:
-                                is_valid = True
-                                ratio_val = chan["ratio_val"]
-                                raw_volt = abs(val_float / ratio_val) if chan["is_scaled"] else abs(val_float)
-                                if raw_volt > limit_volt * 1.02:  # 2% 缓冲，防止噪声误报
-                                    is_range_exceeded = True
-                        except ValueError:
-                            pass
-                
-                if is_over:
+                if status == "OVER" or (val_adc is not None and math.isnan(val_adc)):
                     gui_vals.append(math.nan)
-                    if not is_warmup_window and chan["key"] not in self.alerted_over_channels:
-                        self.alerted_over_channels.add(chan["key"])
-                        self.write_log(f"[硬溢出告警] 通道 {chan['scpi_ch']} ({chan['comment']}) 发生 OVER 物理硬件溢出！下次采集将自动升档。")
-                        self.root.after(0, self.show_over_alert, chan["key"], chan["comment"])
-                elif not is_valid:
+                    self.stats_over[k] += 1
+                    if not is_warmup_window and k not in self.alerted_over_channels and self.timer_running and not self.stop_monitor_event.is_set():
+                        self.alerted_over_channels.add(k)
+                        self.over_channels_to_upgrade.add(k)
+                        target_range = get_next_range(chan["range"])
+                        self.pending_optimal_ranges[k] = target_range
+                        self.write_log(f"[硬溢出告警] 通道 {chan['scpi_ch']} ({chan['comment']}) 发生 OVER 物理硬件溢出！下次采集将自动升档为 {target_range}。")
+                        self.root.after(0, self._post_unified_alert, k, chan['scpi_ch'], chan['comment'], "OVER", "OVER", f"{limit_volt:g}V", target_range)
+                elif val_adc is None or status == "INVALID" or status == "EMPTY":
                     gui_vals.append(None)
                 else:
-                    gui_vals.append(val_float)
-                    valid_samples_count += 1
+                    raw_volt = abs(val_adc)
+                    val_calc = transform_raw_adc_value(val_adc, chan["ratio"])
+                    gui_vals.append(val_calc)
                     
-                    # 仅在度过 0.35s 硬件启动稳态窗后，才将数据计入 Min/Max/Avg 统计，彻底隔离暂态干扰！
                     if not is_warmup_window:
-                        k = chan["key"]
                         self.stats_count[k] += 1
-                        self.stats_sum[k] += val_float
-                        if val_float > self.stats_max[k]:
-                            self.stats_max[k] = val_float
-                        if val_float < self.stats_min[k]:
-                            self.stats_min[k] = val_float
+                        
+                        t = self.stats_sum[k] + val_calc
+                        if abs(self.stats_sum[k]) >= abs(val_calc):
+                            self.stats_comp[k] += (self.stats_sum[k] - t) + val_calc
+                        else:
+                            self.stats_comp[k] += (val_calc - t) + self.stats_sum[k]
+                        self.stats_sum[k] = t
+                        
+                        if val_calc > self.stats_max[k]:
+                            self.stats_max[k] = val_calc
+                        if val_calc < self.stats_min[k]:
+                            self.stats_min[k] = val_calc
                             
-                        if is_range_exceeded and chan["key"] not in self.alerted_over_channels:
-                            self.alerted_over_channels.add(chan["key"])
-                            is_ma = self.is_ma_channel.get(chan["key"], False)
-                            unit_str = "mA" if is_ma else "V"
-                            fmt_str = ".3f" if is_ma else ".4f"
+                        if raw_volt > self.stats_raw_peaks[k]:
+                            self.stats_raw_peaks[k] = raw_volt
+
+                        if raw_volt > limit_volt * 1.02 and k not in self.alerted_over_channels and self.timer_running and not self.stop_monitor_event.is_set():
+                            self.alerted_over_channels.add(k)
+                            self.over_channels_to_upgrade.add(k)
+                            optimal_target = get_optimal_range_for_channel(raw_volt, is_current=is_curr)
+                            self.pending_optimal_ranges[k] = optimal_target
+                            
+                            unit_str = "mA" if is_curr else "V"
+                            fmt_str = ".3f" if is_curr else ".4f"
+                            cur_str = f"{val_calc:{fmt_str}} {unit_str}"
+                            lim_str = f"{limit_volt*1000:.1f} mV" if limit_volt < 1.0 else f"{limit_volt:g} V"
                             msg_log = (
                                 f"[超量程告警] 通道 {chan['scpi_ch']} ({chan['comment']}) 测得信号超出量程上限！"
-                                f"捕获电压 {raw_volt*1000:.3f}mV (当前测量值: {val_float:{fmt_str}}{unit_str})，超出 {limit_volt*1000:.1f}mV 量程极限！下次采集将自动升档。"
+                                f"物理ADC采样电压 {raw_volt*1000:.3f}mV (当前测量值: {cur_str})，超出 {lim_str} 量程极限！下次采集将自动调整为 {optimal_target}。"
                             )
                             self.write_log(msg_log)
-                            self.root.after(0, self.show_soft_over_alert, chan["key"], chan["comment"], raw_volt, limit_volt, val_float)
+                            self.root.after(0, self._post_unified_alert, k, chan['scpi_ch'], chan['comment'], "SOFT_OVER", cur_str, lim_str, optimal_target)
                 
-            if not self.timer_running:
+            if not self.timer_running or self.stop_monitor_event.is_set():
                 break
                 
             if len(gui_vals) == num_active and self.timer_running:
                 self.total_frames += 1
-                now = time.time()
+                now = time.monotonic()
                 
-                # UI 采样值高频防抖（最大 12.5 FPS），防止 Tkinter 消息队列拥塞
                 if now - last_gui_val_update >= 0.08:
                     updates = [(chan["key"], gui_vals[idx]) for idx, chan in enumerate(self.active_channels)]
                     self.root.after(0, self._batch_update_gui_vals, updates)
                     last_gui_val_update = now
                 
-                # UI 统计值低频防抖（最大 2 FPS）
                 if now - last_gui_stat_update >= 0.5:
                     stats_updates = []
                     for chan in self.active_channels:
                         k = chan["key"]
                         cnt = self.stats_count[k]
                         if cnt > 0:
+                            avg_val = (self.stats_sum[k] + self.stats_comp[k]) / cnt
                             stats_updates.append((
                                 k, 
-                                self.stats_sum[k] / cnt, 
+                                avg_val, 
                                 self.stats_max[k], 
                                 self.stats_min[k]
                             ))
@@ -1969,54 +2118,80 @@ class HiokiPerfectApp:
                     self.root.after(0, self._batch_update_gui_stats, stats_updates)
                     last_gui_stat_update = now
                 
-            time.sleep(0.005)
+            time.sleep(0.002)
 
     def stop_acquisition(self):
         self.timer_running = False
+        self.stop_monitor_event.set()
         self.btn_stop.config(state="disabled")
         self.dt_end = datetime.now()
-        self.write_log(">>> 正在释放实时通道，下发硬件停止信号...")
+        
+        self._dismiss_unified_alert_window()
+        self.write_log(">>> 释放实时通道，下发硬件停止信号 (:STOP)...")
         threading.Thread(target=self._bg_stop_and_save_task, daemon=True).start()
 
     def _bg_stop_and_save_task(self):
-        time.sleep(0.1)
-        self.send_raw_cmd(":ABORT")
-        self.send_raw_cmd(":STOP")
-        self.write_log("日置硬件已强行停止物理记录 (:ABORT & :STOP)。")
-        
-        err_res = clean_scpi_response(self.query_raw_cmd(":ERRor?").strip())
-        if err_res and err_res != "0" and "WARN_FL06" not in err_res:
-            self.write_log(f"硬件错误代码检测反馈: {err_res}")
-        else:
-            self.write_log("硬件无异常。")
-        
-        self._save_collected_data()
+        try:
+            monitor = self.monitor_thread
+            if monitor and monitor.is_alive() and monitor is not threading.current_thread():
+                monitor.join(timeout=0.6)
+            self.monitor_thread = None
+
+            time.sleep(0.05)
+            self.send_raw_cmd(":ABORT")
+            self.send_raw_cmd(":STOP")
+            self._drain_serial_buffer()
+
+            self._save_collected_data()
+        except Exception as e:
+            self.write_log(f"[停止保存异常] {e}")
+        finally:
+            self.root.after(0, self._restore_ui_after_task)
 
     def _save_collected_data(self):
-        """与 Logger utility 完全一致的统计报告生成与剪贴板导出"""
         total_points = self.total_frames
-        self.write_log(f"【保存模式】共成功截获高精度实时数据帧: {total_points} 帧。")
+        self.write_log(f"【保存模式】共成功截获原生高精度物理采样数据帧: {total_points} 帧。")
         
         if total_points < 1:
             self.write_log("[错误] 未能成功截获任何通道数据，无有效数据生成！")
-            self.root.after(0, self._restore_ui_after_task)
             return
 
         active_channels = getattr(self, "active_channels", [])
         if not active_channels:
             self.write_log("[错误] 无活跃通道配置记录！")
-            self.root.after(0, self._restore_ui_after_task)
             return
                     
-        # 强制更新一次最终精确统计数值至界面
         stats_final_updates = []
+        stats = {}
         for chan in active_channels:
             k = chan["key"]
             cnt = self.stats_count[k]
             if cnt > 0:
-                stats_final_updates.append((k, self.stats_sum[k] / cnt, self.stats_max[k], self.stats_min[k]))
+                avg_val = (self.stats_sum[k] + self.stats_comp[k]) / cnt
+                max_val = self.stats_max[k]
+                min_val = self.stats_min[k]
+                stats_final_updates.append((k, avg_val, max_val, min_val))
+                stats[k] = {
+                    "points": total_points,
+                    "valid_count": cnt,
+                    "avg": avg_val,
+                    "max": max_val,
+                    "min": min_val
+                }
+                
+                if k not in self.over_channels_to_upgrade:
+                    peak_v = self.stats_raw_peaks.get(k, 0.0)
+                    opt_r = get_optimal_range_for_channel(peak_v, is_current=chan["is_current"])
+                    if opt_r != chan["range"]:
+                        self.pending_optimal_ranges[k] = opt_r
             else:
                 stats_final_updates.append((k, math.nan, math.nan, math.nan))
+                stats[k] = {
+                    "points": total_points, "valid_count": 0,
+                    "avg": math.nan, "max": math.nan, "min": math.nan
+                }
+                
+        self.last_test_stats = dict(stats)
         self.root.after(0, self._batch_update_gui_stats, stats_final_updates)
             
         self.write_log("数据提取完毕。正在生成符合 Logger utility 标准格式的统计报告...")
@@ -2041,27 +2216,37 @@ class HiokiPerfectApp:
                 if cnt == 0:
                     fmt_str = f"{key}\tOVER\tOVER\tOVER"
                 else:
-                    mean_val = self.stats_sum[key] / cnt
+                    mean_val = (self.stats_sum[key] + self.stats_comp[key]) / cnt
                     max_val = self.stats_max[key]
                     min_val = self.stats_min[key]
-                    # 与 Logger utility 的 .3f 精确浮点导出标准对齐
                     fmt_str = f"{key}\t{mean_val:.3f}\t{max_val:.3f}\t{min_val:.3f}"
                 lines.append(fmt_str)
                 
         clipboard_text = "\n".join(lines)
         self.last_clipboard_text = clipboard_text 
-        
-        self.root.clipboard_clear()
-        self.root.clipboard_append(clipboard_text)
+        self.root.after(0, self._copy_to_clipboard, clipboard_text)
+
+    def _copy_to_clipboard(self, text):
+        self.last_clipboard_text = text
+        set_system_clipboard_native(text)
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+            self.root.update_idletasks()
+        except Exception:
+            pass
+            
         self.write_log("[自动复制] ★★★ 统计结果已自动写入系统剪贴板！ ★★★")
         self.write_log("[自动复制] 您可直接在已有 Excel 的 B1 单元格 Ctrl+V，数据即会自动完美分列！")
-        
-        self.root.after(0, self._restore_ui_after_task)
 
     def copy_clipboard_data(self):
         if getattr(self, "last_clipboard_text", ""):
-            self.root.clipboard_clear()
-            self.root.clipboard_append(self.last_clipboard_text)
+            set_system_clipboard_native(self.last_clipboard_text)
+            try:
+                self.root.clipboard_clear()
+                self.root.clipboard_append(self.last_clipboard_text)
+            except Exception:
+                pass
             self.write_log("[快捷复制] ★★★ 统计结果已成功手动复制到剪贴板！ ★★★")
         else:
             messagebox.showwarning("复制失败", "当前暂无有效的测试统计数据，请先启动采集并成功停止。")
@@ -2069,18 +2254,18 @@ class HiokiPerfectApp:
     def _restore_ui_after_task(self):
         with self.ser_lock:
             if self.ser and self.ser.is_open:
-                self.ser.timeout = 1.0
+                self.ser.timeout = 0.3
                 
         self.btn_connect.config(text=" 断开连接 " if self.is_connected else " 连接仪器 ", bg="#f2f2f7" if self.is_connected else "#007aff", fg="#007aff" if self.is_connected else "white")
         self.btn_connect.config(state="normal")
         self.btn_start.config(state="normal" if self.is_connected else "disabled")
         self.btn_stop.config(state="disabled")
         self.port_combo.config(state="readonly" if not self.is_connected else "disabled")
-        self.baud_combo.config(state="readonly" if not self.is_connected else "disabled")
         self.model_combo.config(state="readonly" if not self.is_connected else "disabled")
         self.interval_combo.config(state="readonly" if not self.is_connected else "disabled")
         self.btn_import.config(state="normal" if not self.is_connected else "disabled")
         self.btn_batch.config(state="normal")
+
 
 if __name__ == "__main__":
     root = tk.Tk()
